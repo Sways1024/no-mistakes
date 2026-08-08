@@ -469,6 +469,11 @@ func (s *Service) Apply(ctx context.Context) State {
 //	diverged   any       refuse (anchor named, manual   custody at local head;
 //	                     reconcile / rerun offered)     gate reset to it (CAS)
 //	P missing  any       refuse                         refuse
+//	gate head  any       refuse, naming `rerun` (which  custody at local head;
+//	!= P                 validates the gate tip with a  P anchored by exact SHA
+//	                     fresh run) and --keep-local    and the gate head from
+//	                                                    the branch, then gate
+//	                                                    reset to local (CAS)
 //
 // The containment row exists because a cancelled validation routinely leaves P
 // as a REBASE of the local branch onto a newer base: the same logical commits
@@ -499,6 +504,18 @@ func (s *Service) Apply(ctx context.Context) State {
 //   - Anything unverifiable (missing gate where required, moved gate branch,
 //     failed anchor write or fetch, changed assumptions) refuses with a reason
 //     and changes nothing.
+//   - A gate branch that no longer sits at P - a fix-round commit amended or
+//     otherwise rewritten out of the recorded history (issue #642) - is never
+//     adopted or fast-forwarded to by the default path, because nothing here
+//     can prove such a head is pipeline-authored rather than an out-of-band
+//     gate write. The refusal is not a dead end: it names `no-mistakes rerun`,
+//     which keys a fresh validation run to the current gate tip, and
+//     --keep-local, which keeps the operator's head after anchoring BOTH
+//     pipeline heads (P by exact SHA, the observed gate head from the branch)
+//     so the compare-and-swap gate reset loses nothing. A terminal run with no
+//     verified head keeps its existing descendant adoption and additionally
+//     adopts a rewritten gate head that the executable merge proof shows
+//     carries every change the recorded head has.
 //
 // Recovery ends with a persisted custody-return stamp on the run; inspection
 // then reports custody_returned (never-pushed runs) or the ordinary
@@ -539,8 +556,17 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 			return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and the preserved gate head could not be read; no files or refs were changed")
 		}
 		if gateHead != run.HeadSHA {
-			if !isAncestor(ctx, s.GateDir, run.HeadSHA, gateHead) {
-				return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the terminal run has no verified head and the gate head does not descend from the recorded head; no files or refs were changed")
+			// A descendant gate head is adopted as before. A rewritten gate
+			// head - an amended fix-round commit is the reported shape
+			// (issue #642) - never descends from the recorded head, so it is
+			// adopted only when the same executable merge proof used for
+			// local adoption shows it carries every change the recorded head
+			// has. Anything unprovable keeps refusing, now naming the rerun
+			// exit that validates the current gate head with a fresh run.
+			if !isAncestor(ctx, s.GateDir, run.HeadSHA, gateHead) && !preservedContainsLocalWork(ctx, s.GateDir, run.HeadSHA, gateHead) {
+				blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", fmt.Sprintf("the terminal run has no verified head and the gate head %s neither descends from nor provably contains the recorded head %s; run `no-mistakes rerun` to validate the current gate head with a fresh run; no files or refs were changed", gateHead, run.HeadSHA))
+				blocked.NextAction = &NextAction{Code: "rerun_pipeline", Command: "no-mistakes rerun"}
+				return blocked
 			}
 			if err := s.DB.UpdateRunHeadSHA(run.ID, gateHead); err != nil {
 				return blockedPlan(state, StatePipelineOwned, "blocked_recover_unverified_head", "the verified gate head could not be preserved; no files or refs were changed")
@@ -588,7 +614,22 @@ func (s *Service) Recover(ctx context.Context, keepLocal bool) State {
 	// the preserved head is already anchored.
 	resumedKeepLocal := keepLocal && anchored && gateHead == local
 	if gateHead != preserved && !resumedKeepLocal {
-		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_diverged", fmt.Sprintf("the gate branch is at %s, not the preserved pipeline head %s recorded for this run; no files or refs were changed", gateHead, preserved))
+		// An amended or otherwise rewritten fix-round commit leaves the gate
+		// branch at a head this run never recorded (issue #642). Nothing
+		// available here can prove such a head is pipeline-authored rather
+		// than an out-of-band gate write, so the default path never adopts or
+		// fast-forwards to it; instead the refusal names the two guarded
+		// exits. `no-mistakes rerun` keys a fresh run to the current gate
+		// branch tip, validating the rewritten head from scratch before it
+		// can reach the operator's branch. --keep-local keeps the operator's
+		// head without touching the worktree; recoverKeepLocalDivergedGate
+		// anchors both pipeline heads before the gate branch moves off them.
+		if keepLocal {
+			return s.recoverKeepLocalDivergedGate(ctx, run, state, gateHead, anchored)
+		}
+		blocked := blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_diverged", fmt.Sprintf("the gate branch is at %s, not the preserved pipeline head %s recorded for this run; run `no-mistakes rerun` to validate the current gate head with a fresh run, or use --keep-local to return custody at the current local head; no files or refs were changed", gateHead, preserved))
+		blocked.NextAction = &NextAction{Code: "rerun_pipeline", Command: "no-mistakes rerun"}
+		return blocked
 	}
 	if !anchored {
 		if fetchErr := git.FetchRemoteBranchToPrivateRef(ctx, wd, gateDir, branch, anchorRef); fetchErr != nil {
@@ -673,6 +714,40 @@ func (s *Service) recoverKeepLocal(ctx context.Context, run *db.Run, state State
 		}
 	}
 	return s.finishRecover(ctx, run, false)
+}
+
+// recoverKeepLocalDivergedGate performs the explicit keep-local custody return
+// when the gate branch head no longer equals the recorded preserved head - a
+// rewritten fix-round commit is the reported shape (issue #642). The
+// no-data-loss invariant requires every pipeline head to stay reachable
+// locally before the gate branch moves off it: the recorded preserved head,
+// no branch's tip anymore, is anchored by exact SHA (which the gate permits
+// because provisioning enables uploadpack.allowAnySHA1InWant), and the
+// observed gate head is anchored from the gate branch. Either anchor failing
+// refuses with the commit that could not be preserved named and changes no
+// branch or worktree. The gate branch then moves to the kept local head with
+// the same compare-and-swap as the ordinary keep-local path, anchored on the
+// observed gate head so a concurrent gate push still wins.
+func (s *Service) recoverKeepLocalDivergedGate(ctx context.Context, run *db.Run, state State, gateHead string, anchored bool) State {
+	wd := s.workDir()
+	preserved := run.HeadSHA
+	anchorRef := recoverAnchorRef(run.ID)
+	if !anchored {
+		if err := git.FetchRemoteSHAToPrivateRef(ctx, wd, s.GateDir, preserved, anchorRef); err != nil {
+			return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", fmt.Sprintf("the preserved pipeline head %s could not be fetched from the local gate, so keeping the local head would lose it; if the gate predates exact-SHA fetch support, re-run `no-mistakes init` and retry; no files or refs were changed", preserved))
+		}
+		if fetched, err := git.Run(ctx, wd, "rev-parse", anchorRef+"^{commit}"); err != nil || fetched != preserved {
+			return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", fmt.Sprintf("the preserved pipeline head %s could not be verified after anchoring; no files or refs were changed", preserved))
+		}
+	}
+	gateAnchor := recoverGateAnchorRef(run.ID)
+	if err := git.FetchRemoteBranchToPrivateRef(ctx, wd, s.GateDir, state.Local.Branch, gateAnchor); err != nil {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_preserve_failed", fmt.Sprintf("the gate branch head %s could not be anchored locally, so keeping the local head would lose it; no files or refs were changed", gateHead))
+	}
+	if fetched, err := git.Run(ctx, wd, "rev-parse", gateAnchor+"^{commit}"); err != nil || fetched != gateHead {
+		return blockedPlan(state, StatePipelineOwned, "blocked_recover_gate_race", "the gate branch changed while its head was being anchored; re-run the recovery; no local files or refs were changed")
+	}
+	return s.recoverKeepLocal(ctx, run, state, gateHead)
 }
 
 // recoverFastForward advances the clean checked-out branch to the preserved
@@ -907,6 +982,14 @@ func recoverAnchorRef(runID string) string {
 // leaves those SHAs unreferenced by the branch.
 func recoverLocalAnchorRef(runID string) string {
 	return "refs/no-mistakes/recover-local/" + runID
+}
+
+// recoverGateAnchorRef keeps the observed diverged gate branch head reachable
+// locally when --keep-local moves the gate branch off it: unlike the ordinary
+// keep-local cell, that head is not the recorded preserved head, so the
+// preserved anchor alone would leave it unreachable everywhere.
+func recoverGateAnchorRef(runID string) string {
+	return "refs/no-mistakes/recover-gate/" + runID
 }
 
 func (s *Service) inspect(ctx context.Context) (State, *db.Run, bool) {

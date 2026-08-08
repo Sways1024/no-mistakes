@@ -55,6 +55,7 @@ Task:
 Rules:
 - Do not run tests or broader behavioral validation.
 - Focus on lint, format, and static-analysis issues only.
+- Never amend, rebase, or otherwise rewrite existing commits; if you commit at all, only append new commits.
 - Do not report issues you already fixed.
 - The summary must be one concise sentence fragment suitable for a git commit subject.
 - Keep the summary under 10 words.%s`,
@@ -123,6 +124,7 @@ Context:
 Rules:
 - Make the smallest correct root-cause fix.
 - Do not refactor beyond what is needed for that root-cause fix.
+- Never amend, rebase, or otherwise rewrite existing commits; if you commit at all, only append new commits.
 - Do not run tests or broader behavioral validation.
 - Re-run the relevant lint or format commands before finishing.
 - Return JSON with a single "summary" field when you are done.

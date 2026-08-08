@@ -602,6 +602,11 @@ func migrateGateConfig(ctx context.Context, bareDir string) error {
 	if _, err := git.RunBare(ctx, bareDir, "config", "receive.advertisePushOptions", "true"); err != nil {
 		return fmt.Errorf("enable push options: %w", err)
 	}
+	// Mirrors gate provisioning: custody recovery anchors a rewritten-away
+	// preserved head from the gate by exact SHA (issue #642).
+	if _, err := git.RunBare(ctx, bareDir, "config", "uploadpack.allowAnySHA1InWant", "true"); err != nil {
+		return fmt.Errorf("enable exact-sha fetches: %w", err)
+	}
 	isolated, err := ensureGateHooksPathIsolation(ctx, bareDir)
 	if err != nil {
 		return fmt.Errorf("isolate hooks path: %w", err)

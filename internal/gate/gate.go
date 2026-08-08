@@ -190,6 +190,14 @@ func provisionGate(ctx context.Context, bareDir, absRoot, upstreamURL, reposDir 
 	if _, err := git.RunBare(ctx, bareDir, "config", "receive.advertisePushOptions", "true"); err != nil {
 		return fmt.Errorf("enable push options: %w", err)
 	}
+	// Custody recovery may need to anchor a preserved head that a rewritten
+	// fix-round commit left as no branch's tip; allow the operator worktree to
+	// fetch such a commit from the gate by exact SHA (branchsync.Recover
+	// --keep-local, issue #642). The gate is a local, single-operator bare
+	// repo, so exposing unreachable objects is not a confidentiality boundary.
+	if _, err := git.RunBare(ctx, bareDir, "config", "uploadpack.allowAnySHA1InWant", "true"); err != nil {
+		return fmt.Errorf("enable exact-sha fetches: %w", err)
+	}
 
 	if err := git.RefreshManagedGateHooks(bareDir); err != nil {
 		return fmt.Errorf("install hooks: %w", err)

@@ -1594,3 +1594,227 @@ func TestRecoverSquashedPreservedHeadStillEscalatesForDroppedLocalWork(t *testin
 		t.Fatal("dropped-work escalation stamped custody")
 	}
 }
+
+// amendGateTip rewrites the gate branch tip in place - the issue #642 shape,
+// where a fix-round agent amended its commit instead of appending a new one -
+// leaving the run's recorded head (f.preserved) as no branch's tip. mutate
+// edits the checkout before the amend, and the run row stays untouched, still
+// recording the pre-amend preserved head.
+func (f *recoverFixture) amendGateTip(t *testing.T, mutate func(dir string)) string {
+	t.Helper()
+	amendDir := filepath.Join(t.TempDir(), "amend")
+	mustRun(t, filepath.Dir(amendDir), "-c", "core.autocrlf=false", "clone", f.gate, amendDir)
+	configureIdentity(t, amendDir)
+	mustRun(t, amendDir, "checkout", "feature/recover")
+	mutate(amendDir)
+	mustRun(t, amendDir, "add", "-A")
+	mustRun(t, amendDir, "commit", "--amend", "--no-edit")
+	amended := mustRun(t, amendDir, "rev-parse", "HEAD")
+	mustRun(t, amendDir, "push", "--force", "origin", "HEAD:refs/heads/feature/recover")
+	return amended
+}
+
+func (f *recoverFixture) gateAnchorRef() string {
+	return "refs/no-mistakes/recover-gate/" + f.run.ID
+}
+
+// TestRecoverAmendedGateHeadRefusalNamesRerunAndKeepLocalEscapes is the core
+// regression for issue #642: an amended fix-round commit leaves the gate
+// branch off the recorded preserved head, and the resulting refusal used to be
+// a dead end with no next action. The default path must keep refusing - the
+// gate head cannot be proven pipeline-authored, containment or not - but the
+// refusal now names the two guarded exits: `no-mistakes rerun`, which
+// validates the current gate tip with a fresh run, and --keep-local.
+func TestRecoverAmendedGateHeadRefusalNamesRerunAndKeepLocalEscapes(t *testing.T) {
+	t.Parallel()
+
+	for _, tt := range []struct {
+		name   string
+		mutate func(dir string)
+	}{
+		{name: "content-superset amend", mutate: func(dir string) {
+			mustWrite(t, filepath.Join(dir, "extra.txt"), "amended addition\n")
+		}},
+		{name: "content-rewriting amend", mutate: func(dir string) {
+			mustWrite(t, filepath.Join(dir, "fix.txt"), "pipeline fix 2 rewritten\n")
+		}},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			f := newRecoverFixture(t, types.RunFailed)
+			amended := f.amendGateTip(t, tt.mutate)
+			if amended == f.preserved {
+				t.Fatal("fixture did not rewrite the gate tip")
+			}
+
+			state := f.service.Recover(f.ctx, false)
+			if state.Recovered || state.Changed || state.Safety != "blocked_recover_gate_diverged" {
+				t.Fatalf("amended-gate recover = %#v", state)
+			}
+			if state.NextAction == nil || state.NextAction.Code != "rerun_pipeline" || state.NextAction.Command != "no-mistakes rerun" {
+				t.Fatalf("amended-gate refusal next action = %#v", state.NextAction)
+			}
+			if !strings.Contains(state.Error, "no-mistakes rerun") || !strings.Contains(state.Error, "--keep-local") {
+				t.Fatalf("amended-gate refusal not actionable: %q", state.Error)
+			}
+			if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+				t.Fatal("amended-gate refusal moved HEAD")
+			}
+			if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != amended {
+				t.Fatalf("amended-gate refusal moved the gate branch to %s", got)
+			}
+			if f.custodyReturned() {
+				t.Fatal("amended-gate refusal stamped custody")
+			}
+		})
+	}
+}
+
+// TestRecoverUnverifiedAmendedGateHeadAdoptsWhenContainmentProven extends the
+// unverified-head adoption to the amend shape: with no verified head the gate
+// branch is already the best evidence of the pipeline's last state, and a
+// descendant gate head was always adopted. An amended head never descends, so
+// it is adopted only when the executable merge proof shows it carries every
+// change the recorded head has; the recovery then proceeds through the
+// ordinary matrix at the adopted head.
+func TestRecoverUnverifiedAmendedGateHeadAdoptsWhenContainmentProven(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunRunning)
+	if err := f.db.UpdateRunStatus(f.run.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	amended := f.amendGateTip(t, func(dir string) {
+		mustWrite(t, filepath.Join(dir, "extra.txt"), "amended addition\n")
+	})
+
+	state := f.service.Recover(f.ctx, false)
+	if !state.Recovered || !state.Changed || state.State != StateCustodyReturned {
+		t.Fatalf("unverified amended-gate recover = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != amended {
+		t.Fatalf("HEAD = %s, want adopted amended head %s", got, amended)
+	}
+	if got := readOptional(t, filepath.Join(f.local, "extra.txt")); got != "amended addition\n" {
+		t.Fatalf("adopted head content missing: %q", got)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.anchorRef()); got != amended {
+		t.Fatalf("anchor ref = %s, want adopted head %s", got, amended)
+	}
+	run, err := f.db.GetRun(f.run.ID)
+	if err != nil || run == nil {
+		t.Fatalf("reload run: %#v, %v", run, err)
+	}
+	if run.HeadSHA != amended {
+		t.Fatalf("run head = %s, want re-recorded amended head %s", run.HeadSHA, amended)
+	}
+	if !f.custodyReturned() {
+		t.Fatal("custody not stamped")
+	}
+}
+
+// TestRecoverUnverifiedRewrittenGateHeadRefusesWithRerunEscape is the
+// counterfactual: an amend that rewrote recorded content fails the merge proof,
+// so the unverified path keeps refusing - and the refusal now carries the
+// rerun next action instead of stranding the run.
+func TestRecoverUnverifiedRewrittenGateHeadRefusesWithRerunEscape(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunRunning)
+	if err := f.db.UpdateRunStatus(f.run.ID, types.RunFailed); err != nil {
+		t.Fatal(err)
+	}
+	f.amendGateTip(t, func(dir string) {
+		mustWrite(t, filepath.Join(dir, "fix.txt"), "pipeline fix 2 rewritten\n")
+	})
+
+	state := f.service.Recover(f.ctx, false)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_unverified_head" {
+		t.Fatalf("unverified rewritten-gate recover = %#v", state)
+	}
+	if state.NextAction == nil || state.NextAction.Code != "rerun_pipeline" || state.NextAction.Command != "no-mistakes rerun" {
+		t.Fatalf("unverified rewritten-gate next action = %#v", state.NextAction)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatal("unverified rewritten-gate refusal moved HEAD")
+	}
+	if f.custodyReturned() {
+		t.Fatal("unverified rewritten-gate refusal stamped custody")
+	}
+}
+
+// TestRecoverKeepLocalDivergedGateAnchorsBothHeadsAndReturnsCustody covers the
+// explicit --keep-local escape from the amended-gate strand (#642): the
+// recorded preserved head is no branch's tip, so it is anchored by exact SHA
+// (the gate permits it via uploadpack.allowAnySHA1InWant, set at provision
+// time and simulated here), the observed gate head is anchored from the
+// branch, and only then does the gate branch CAS-move to the kept local head.
+func TestRecoverKeepLocalDivergedGateAnchorsBothHeadsAndReturnsCustody(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunFailed)
+	mustRun(t, f.gate, "config", "uploadpack.allowAnySHA1InWant", "true")
+	amended := f.amendGateTip(t, func(dir string) {
+		mustWrite(t, filepath.Join(dir, "fix.txt"), "pipeline fix 2 rewritten\n")
+	})
+
+	state := f.service.Recover(f.ctx, true)
+	if !state.Recovered || state.Changed {
+		t.Fatalf("keep-local diverged-gate recover = %#v", state)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatal("keep-local moved the worktree")
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != f.submitted {
+		t.Fatalf("gate branch = %s, want kept local head %s", got, f.submitted)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.anchorRef()); got != f.preserved {
+		t.Fatalf("preserved anchor = %s, want %s", got, f.preserved)
+	}
+	if got := mustRun(t, f.local, "rev-parse", f.gateAnchorRef()); got != amended {
+		t.Fatalf("gate-head anchor = %s, want %s", got, amended)
+	}
+	if !f.custodyReturned() {
+		t.Fatal("keep-local diverged-gate did not stamp custody")
+	}
+}
+
+// TestRecoverKeepLocalDivergedGateRefusesWhenPreservedCannotBeAnchored pins the
+// no-data-loss boundary of that escape: when the preserved head genuinely
+// cannot be fetched from the gate (here the gate pruned the rewritten-away
+// commit), keep-local refuses with the unpreservable commit named and mutates
+// nothing.
+func TestRecoverKeepLocalDivergedGateRefusesWhenPreservedCannotBeAnchored(t *testing.T) {
+	t.Parallel()
+
+	f := newRecoverFixture(t, types.RunFailed)
+	amended := f.amendGateTip(t, func(dir string) {
+		mustWrite(t, filepath.Join(dir, "fix.txt"), "pipeline fix 2 rewritten\n")
+	})
+	// The amend left the preserved head unreachable in the gate; a gc prunes
+	// it, making the exact-SHA anchor fetch genuinely impossible.
+	mustRun(t, f.gate, "reflog", "expire", "--expire=now", "--all")
+	mustRun(t, f.gate, "gc", "--prune=now")
+	if _, err := gitpkg.Run(f.ctx, f.gate, "cat-file", "-e", f.preserved+"^{commit}"); err == nil {
+		t.Fatal("fixture did not prune the preserved head from the gate")
+	}
+
+	state := f.service.Recover(f.ctx, true)
+	if state.Recovered || state.Changed || state.Safety != "blocked_recover_preserve_failed" {
+		t.Fatalf("unanchorable keep-local recover = %#v", state)
+	}
+	if !strings.Contains(state.Error, f.preserved) {
+		t.Fatalf("refusal does not name the unpreservable commit: %q", state.Error)
+	}
+	if got := mustRun(t, f.local, "rev-parse", "HEAD"); got != f.submitted {
+		t.Fatal("unanchorable keep-local moved HEAD")
+	}
+	if got := mustRun(t, f.gate, "rev-parse", "refs/heads/feature/recover"); got != amended {
+		t.Fatalf("unanchorable keep-local moved the gate branch to %s", got)
+	}
+	if _, err := gitpkg.Run(f.ctx, f.local, "rev-parse", f.anchorRef()); err == nil {
+		t.Fatal("unanchorable keep-local wrote a preserved anchor it could not verify")
+	}
+	if f.custodyReturned() {
+		t.Fatal("unanchorable keep-local stamped custody")
+	}
+}

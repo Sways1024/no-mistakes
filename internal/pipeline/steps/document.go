@@ -245,6 +245,7 @@ Task:
 
 Rules:
 %s
+- Never amend, rebase, or otherwise rewrite existing commits; if you commit at all, only append new commits.
 - The summary must be one concise sentence fragment suitable for a git commit subject.
 - Keep the summary under 10 words.%s`,
 		intro,
