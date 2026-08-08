@@ -418,7 +418,10 @@ func TestCIStep_CIWarningAllowsChecksPassedToBeReannounced(t *testing.T) {
 	sctx := newTestContext(t, ag, dir, baseSHA, headSHA, config.Commands{})
 	sctx.Env = env
 	sctx.Run.PRURL = &prURL
-	sctx.Config.CITimeout = 10 * time.Second
+	// This test's assertions require the monitor to still be running at the
+	// third poll; the timeout only needs to be comfortably above the wall
+	// time three fake-gh invocations can take under parallel -race load.
+	sctx.Config.CITimeout = 60 * time.Second
 
 	var logs []string
 	sctx.Log = func(s string) { logs = append(logs, s) }
