@@ -39,7 +39,7 @@ func TestReinstallSystemdServiceInheritsProxyFromExistingUnitWhenEnvUnset(t *tes
 
 	// Render and persist the exact unit a proxy-time install produces, including
 	// a percent-encoded credential whose % the renderer doubled.
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://user:p%40ss@127.0.0.1:7897")
@@ -49,7 +49,7 @@ func TestReinstallSystemdServiceInheritsProxyFromExistingUnitWhenEnvUnset(t *tes
 	}
 
 	// The daemon now restarts from a shell WITHOUT the proxy exported.
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 
@@ -102,7 +102,7 @@ func TestReinstallLaunchAgentInheritsProxyFromExistingPlistWhenEnvUnset(t *testi
 		t.Fatal(err)
 	}
 
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://user:pass@127.0.0.1:7897")
@@ -111,7 +111,7 @@ func TestReinstallLaunchAgentInheritsProxyFromExistingPlistWhenEnvUnset(t *testi
 		t.Fatal(err)
 	}
 
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 
@@ -170,7 +170,7 @@ func TestInstallSystemdUserServiceInheritsProxyFromExistingWhenEnvUnset(t *testi
 		t.Fatal(err)
 	}
 
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://user:pass@127.0.0.1:7897")
@@ -179,7 +179,7 @@ func TestInstallSystemdUserServiceInheritsProxyFromExistingWhenEnvUnset(t *testi
 	}
 
 	// Reinstall from a shell without the proxy exported.
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	if err := installSystemdUserService(p, "/usr/local/bin/no-mistakes"); err != nil {

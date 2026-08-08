@@ -161,35 +161,34 @@ func reinstallManagedServiceIfChanged(p *paths.Paths) (bool, error) {
 	}
 
 	existing, readErr := os.ReadFile(installPath)
-	// Inherit any proxy already baked into the existing definition so an
-	// env-less `daemon start` does not render a no-proxy target, falsely detect
-	// drift, and reinstall - which would strip the proxy and re-break the daemon
-	// with "403 Request not allowed". This mirrors the executable inheritance
-	// below: prefer the current environment, fall back to what is on disk.
-	var inheritedProxyEnv [][2]string
+	// Inherit any proxy or telemetry values already baked into the existing
+	// definition so an env-less `daemon start` does not render an env-less
+	// target, falsely detect drift, and reinstall - which would strip the proxy
+	// (re-breaking the daemon with "403 Request not allowed") or the telemetry
+	// opt-out. This mirrors the executable inheritance below: prefer the
+	// current environment per category, fall back to what is on disk (see
+	// mergeForwardedEnv).
+	var inheritedForwardedEnv [][2]string
 	if readErr == nil {
 		switch runtimeGOOS {
 		case "darwin":
 			if existingExe, ok := launchAgentExecutable(existing); ok {
 				renderedExecutable = existingExe
 			}
-			inheritedProxyEnv = launchAgentProxyEnv(existing)
+			inheritedForwardedEnv = launchAgentForwardedEnv(existing)
 		case "linux":
 			if existingExe, ok := systemdUnitExecutable(existing); ok {
 				renderedExecutable = existingExe
 			}
-			inheritedProxyEnv = systemdUnitProxyEnv(existing)
+			inheritedForwardedEnv = systemdUnitForwardedEnv(existing)
 		}
 	}
-	proxyEnv := serviceProxyEnv()
-	if len(proxyEnv) == 0 {
-		proxyEnv = inheritedProxyEnv
-	}
+	forwardedEnv := mergeForwardedEnv(serviceForwardedEnv(), inheritedForwardedEnv)
 	switch runtimeGOOS {
 	case "darwin":
-		wanted = renderLaunchAgentWithProxyEnv(renderedExecutable, p, home, proxyEnv)
+		wanted = renderLaunchAgentWithForwardedEnv(renderedExecutable, p, home, forwardedEnv)
 	case "linux":
-		wanted = renderSystemdUnitWithProxyEnv(renderedExecutable, p, home, proxyEnv)
+		wanted = renderSystemdUnitWithForwardedEnv(renderedExecutable, p, home, forwardedEnv)
 	}
 	switch {
 	case readErr == nil && string(existing) == wanted:

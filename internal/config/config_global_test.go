@@ -453,6 +453,9 @@ func TestDefaultConfigYAML_MatchesGoDefaults(t *testing.T) {
 	if raw.CI.RerunTransient == nil || *raw.CI.RerunTransient != ciDefaults().RerunTransient {
 		t.Errorf("YAML ci.rerun_transient = %v, Go default = %d", raw.CI.RerunTransient, ciDefaults().RerunTransient)
 	}
+	if raw.Review.MaxRounds == nil || *raw.Review.MaxRounds != reviewDefaults().MaxRounds {
+		t.Errorf("YAML review.max_rounds = %v, Go default = %d", raw.Review.MaxRounds, reviewDefaults().MaxRounds)
+	}
 }
 
 func TestLoadGlobal_AutoFixDefaults(t *testing.T) {

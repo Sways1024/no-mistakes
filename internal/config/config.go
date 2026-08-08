@@ -58,6 +58,15 @@ const (
 	// with an agent round, but they are not free: each one keeps the monitor
 	// polling the same commit, so the budget stays small by construction.
 	MaxCIRerunTransient = 5
+	// DefaultReviewMaxRounds is the review.max_rounds value when unset: the
+	// maximum total review rounds (the initial review plus every
+	// fix-triggered rereview) a single run may execute. A thorough reviewer
+	// can substantiate new findings on every full pass over a large diff, so
+	// without a stopping rule the fix->rereview loop has no fixed point and a
+	// run can rereview for hours (issue #683). At the cap, further fix
+	// responses are rejected and the gate stays parked for a terminal
+	// approve/skip/abort decision. 0 means unlimited.
+	DefaultReviewMaxRounds = 10
 )
 
 // GlobalConfig represents ~/.no-mistakes/config.yaml.
@@ -83,7 +92,11 @@ type GlobalConfig struct {
 	// budget can be set for a repository whose default branch this machine's
 	// user does not control (the common case when contributing to someone
 	// else's project), and a trusted repo value still wins over it.
-	CI     CIRaw
+	CI CIRaw
+	// Review carries the operator's review-step settings; only max_rounds is
+	// meaningful globally (path_instructions are per-repo and read from the
+	// trusted default-branch copy).
+	Review ReviewRaw
 	Commit CommitRaw
 	Intent IntentRaw
 	Test   TestRaw
@@ -104,6 +117,7 @@ type globalConfigRaw struct {
 	SessionReuse         *bool               `yaml:"session_reuse"`
 	AutoFix              AutoFixRaw          `yaml:"auto_fix"`
 	CI                   CIRaw               `yaml:"ci"`
+	Review               ReviewRaw           `yaml:"review"`
 	Commit               CommitRaw           `yaml:"commit"`
 	Intent               IntentRaw           `yaml:"intent"`
 	Test                 TestRaw             `yaml:"test"`
@@ -179,6 +193,10 @@ type ReviewRaw struct {
 	// at least one changed file; a run that touches nothing matching leaves
 	// the review prompt exactly as it is without this setting.
 	PathInstructions []PathInstruction `yaml:"path_instructions"`
+	// MaxRounds caps the total review rounds (the initial review plus every
+	// fix-triggered rereview) per run. The pointer distinguishes "not set"
+	// (nil, inherit) from an explicit 0, which means unlimited.
+	MaxRounds *int `yaml:"max_rounds"`
 }
 
 // PathInstruction is one glob-scoped block of review guidance. Path follows the
@@ -416,6 +434,11 @@ type Document struct {
 // changed paths each glob matches.
 type Review struct {
 	PathInstructions []PathInstruction
+	// MaxRounds is the cap on total review rounds (the initial review plus
+	// every fix-triggered rereview) per run. Past it, fix responses are
+	// rejected so the parked gate forces a terminal approve/skip/abort
+	// decision instead of another rereview. 0 means unlimited.
+	MaxRounds int
 }
 
 // TestRaw is the YAML representation of test-step settings.
@@ -625,6 +648,16 @@ auto_fix:
 # default branch overrides this value.
 ci:
   rerun_transient: 0
+
+# Maximum total review rounds per run: the initial review plus every
+# fix-triggered rereview, whether requested by auto-fix, a human, or a driving
+# agent (axi respond --action fix). At the cap, further fix responses are
+# rejected and the review gate stays parked for an approve/skip/abort decision,
+# so a reviewer that keeps finding new issues cannot rereview a run
+# indefinitely. 0 = unlimited. A repository's trusted default-branch
+# .no-mistakes.yaml may override this value.
+review:
+  max_rounds: 10
 
 # Auto-fix commit subject template. Available variables: {{.Step}} and {{.Summary}}.
 # Repo config may override this value.
@@ -1211,6 +1244,7 @@ func LoadGlobal(path string) (*GlobalConfig, error) {
 	}
 	cfg.AutoFix = raw.AutoFix
 	cfg.CI = raw.CI
+	cfg.Review = raw.Review
 	cfg.Commit = raw.Commit
 	cfg.Intent = raw.Intent
 	cfg.Test = raw.Test
@@ -1574,6 +1608,24 @@ func applyCIOverrides(dst *CI, src *CIRaw) {
 	dst.RerunTransient = min(max(*src.RerunTransient, 0), MaxCIRerunTransient)
 }
 
+// reviewDefaults returns the default review-step settings. The round cap is
+// non-zero by default because an uncapped fix->rereview loop has no guaranteed
+// fixed point (issue #683); operators who want the old unbounded behavior set
+// review.max_rounds: 0 explicitly.
+func reviewDefaults() Review {
+	return Review{MaxRounds: DefaultReviewMaxRounds}
+}
+
+// applyReviewOverrides applies non-nil raw values onto resolved defaults. Any
+// non-positive max_rounds value means unlimited, matching ci_timeout's
+// non-positive-is-unlimited convention, so a negative value cannot invert the
+// bound.
+func applyReviewOverrides(dst *Review, src *ReviewRaw) {
+	if src.MaxRounds != nil {
+		dst.MaxRounds = max(*src.MaxRounds, 0)
+	}
+}
+
 // applyAutoFixOverrides applies non-nil raw values onto resolved defaults.
 func applyAutoFixOverrides(dst *AutoFix, src *AutoFixRaw) {
 	if src.Lint != nil {
@@ -1633,6 +1685,15 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 	applyCIOverrides(&ci, &global.CI)
 	applyCIOverrides(&ci, &repo.CI)
 
+	review := reviewDefaults()
+	// Like ci.rerun_transient, the repo's review block is trusted-only
+	// (EffectiveRepoConfig sourced it from the default branch), so a pushed
+	// branch cannot raise its own round budget; path_instructions stay
+	// repo-scoped and are resolved below.
+	applyReviewOverrides(&review, &global.Review)
+	applyReviewOverrides(&review, &repo.Review)
+	review.PathInstructions = resolvePathInstructions(repo.Review.PathInstructions)
+
 	intent := intentDefaults()
 	applyIntentOverrides(&intent, &global.Intent)
 	applyIntentOverrides(&intent, &repo.Intent)
@@ -1668,7 +1729,7 @@ func Merge(global *GlobalConfig, repo *RepoConfig) *Config {
 		Intent:               intent,
 		Test:                 test,
 		Document:             Document{Instructions: strings.TrimSpace(repo.Document.Instructions)},
-		Review:               Review{PathInstructions: resolvePathInstructions(repo.Review.PathInstructions)},
+		Review:               review,
 		// repo is the EffectiveRepoConfig result, so this value is already
 		// trusted-only (EffectiveRepoConfig sourced it from the trusted copy).
 		DisableProjectSettings: repo.DisableProjectSettings,

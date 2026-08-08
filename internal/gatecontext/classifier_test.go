@@ -2,11 +2,14 @@ package gatecontext_test
 
 import (
 	"context"
+	"database/sql"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
 	"testing"
+
+	_ "modernc.org/sqlite"
 
 	"github.com/kunchenguid/no-mistakes/internal/db"
 	"github.com/kunchenguid/no-mistakes/internal/gate"
@@ -253,5 +256,100 @@ func run(t *testing.T, dir, name string, args ...string) {
 	cmd.Env = append(os.Environ(), "GIT_CONFIG_COUNT=0")
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("%s %v in %s: %v\n%s", name, args, dir, err, out)
+	}
+}
+
+// TestInspectorDegradesToUnnestedOnPreMigrationSchema reproduces #655: the
+// read-only authorization preflight runs before any migration (only the
+// daemon's db.Open migrates), so a state database created by an older binary
+// must classify as not nested instead of failing with "no such column" and
+// starving the daemon start that would migrate it.
+func TestInspectorDegradesToUnnestedOnPreMigrationSchema(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "relocated-nm-home")
+	p := paths.WithRoot(root)
+	if err := p.EnsureDirs(); err != nil {
+		t.Fatalf("ensure paths: %v", err)
+	}
+	origin := filepath.Join(t.TempDir(), "origin.git")
+	run(t, "", "git", "init", "--bare", "--initial-branch=main", origin)
+	work := filepath.Join(t.TempDir(), "work")
+	initOrdinaryRepo(t, work, origin)
+	createPreMigrationStateDB(t, p.DB(), work)
+	database, err := db.OpenReadOnly(p.DB())
+	if err != nil {
+		t.Fatalf("open legacy db read-only: %v", err)
+	}
+	t.Cleanup(func() { _ = database.Close() })
+	inspector := gatecontext.Inspector{DB: database, Paths: p}
+
+	got, err := inspector.Inspect(context.Background(), gatecontext.Request{CWD: work})
+	if err != nil {
+		t.Fatalf("inspect ordinary caller on pre-migration schema: %v", err)
+	}
+	if got.Nested {
+		t.Fatalf("ordinary caller rejected on pre-migration schema: %+v", got)
+	}
+
+	gateDir := filepath.Join(p.ReposDir(), "legacyrepo.git")
+	run(t, "", "git", "clone", "--bare", origin, gateDir)
+	managed := filepath.Join(p.WorktreesDir(), "legacyrepo", "managed-run")
+	run(t, gateDir, "git", "worktree", "add", "--detach", managed, "main")
+	got, err = inspector.Inspect(context.Background(), gatecontext.Request{CWD: managed})
+	if err != nil {
+		t.Fatalf("inspect gate-shaped worktree on pre-migration schema: %v", err)
+	}
+	if got.Nested {
+		t.Fatalf("gate-shaped worktree rejected on pre-migration schema: %+v", got)
+	}
+}
+
+// createPreMigrationStateDB builds a state database with the trimmed schema of
+// a pre-v1.42.0 binary: repos without fork_url and runs without the later
+// ALTER-added columns (review_approved_head_sha and friends), plus a row that
+// still claims to be running so degradation, not row absence, is what allows
+// classification to proceed.
+func createPreMigrationStateDB(t *testing.T, path, workingPath string) {
+	t.Helper()
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	stmts := []string{
+		`CREATE TABLE repos (
+			id             TEXT PRIMARY KEY,
+			working_path   TEXT NOT NULL UNIQUE,
+			upstream_url   TEXT NOT NULL,
+			default_branch TEXT NOT NULL DEFAULT 'main',
+			created_at     INTEGER NOT NULL
+		)`,
+		`CREATE TABLE runs (
+			id         TEXT PRIMARY KEY,
+			repo_id    TEXT NOT NULL REFERENCES repos(id) ON DELETE CASCADE,
+			branch     TEXT NOT NULL,
+			head_sha   TEXT NOT NULL,
+			base_sha   TEXT NOT NULL,
+			status     TEXT NOT NULL DEFAULT 'pending',
+			pr_url     TEXT,
+			error      TEXT,
+			created_at INTEGER NOT NULL,
+			updated_at INTEGER NOT NULL
+		)`,
+		`CREATE TABLE step_results (
+			id         TEXT PRIMARY KEY,
+			run_id     TEXT NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+			step_name  TEXT NOT NULL,
+			step_order INTEGER NOT NULL,
+			status     TEXT NOT NULL DEFAULT 'pending'
+		)`,
+		`INSERT INTO repos (id, working_path, upstream_url, created_at) VALUES ('legacyrepo', '` + workingPath + `', 'https://example.com/upstream.git', 1)`,
+		`INSERT INTO runs (id, repo_id, branch, head_sha, base_sha, status, created_at, updated_at) VALUES ('legacy-run', 'legacyrepo', 'feature', 'head', 'base', 'running', 1, 1)`,
+	}
+	for _, stmt := range stmts {
+		if _, err := legacy.Exec(stmt); err != nil {
+			t.Fatalf("build legacy schema: %v", err)
+		}
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
 	}
 }

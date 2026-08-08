@@ -19,13 +19,13 @@ func installSystemdUserService(p *paths.Paths, exe string) error {
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
 		return fmt.Errorf("create systemd user directory: %w", err)
 	}
-	// writeServiceFile resolves the proxy environment once and feeds it to the
-	// renderer, so the unit content and its permission mode stay in sync
-	// (see serviceProxyEnv / writeServiceFile).
-	render := func(proxyEnv [][2]string) string {
-		return renderSystemdUnitWithProxyEnv(exe, p, home, proxyEnv)
+	// writeServiceFile resolves the forwarded environment once and feeds it to
+	// the renderer, so the unit content and its permission mode stay in sync
+	// (see serviceForwardedEnv / writeServiceFile).
+	render := func(forwardedEnv [][2]string) string {
+		return renderSystemdUnitWithForwardedEnv(exe, p, home, forwardedEnv)
 	}
-	if err := writeServiceFile(path, systemdUnitProxyEnv, render); err != nil {
+	if err := writeServiceFile(path, systemdUnitForwardedEnv, render); err != nil {
 		return fmt.Errorf("write systemd unit: %w", err)
 	}
 	if _, err := serviceCommandRunner("systemctl", "--user", "daemon-reload"); err != nil {
@@ -86,19 +86,19 @@ func legacySystemdUserServicePath() string {
 	return filepath.Join(home, ".config", "systemd", "user", legacySystemdServiceName)
 }
 
-// renderSystemdUnit renders the systemd unit, resolving the proxy environment
-// from the current process environment itself. It is a convenience wrapper used
-// only by tests; production callers use renderSystemdUnitWithProxyEnv, because
-// both the install path and drift detection resolve the proxy environment once
-// (preferring the on-disk definition when the live environment has none) and
-// pass it in.
+// renderSystemdUnit renders the systemd unit, resolving the forwarded
+// environment from the current process environment itself. It is a convenience
+// wrapper used only by tests; production callers use
+// renderSystemdUnitWithForwardedEnv, because both the install path and drift
+// detection resolve the forwarded environment once (preferring the on-disk
+// definition when the live environment has none) and pass it in.
 func renderSystemdUnit(exe string, p *paths.Paths, home string) string {
-	return renderSystemdUnitWithProxyEnv(exe, p, home, serviceProxyEnv())
+	return renderSystemdUnitWithForwardedEnv(exe, p, home, serviceForwardedEnv())
 }
 
-// renderSystemdUnitWithProxyEnv renders the systemd unit using a proxy
-// environment supplied by the caller (see serviceProxyEnv).
-func renderSystemdUnitWithProxyEnv(exe string, p *paths.Paths, home string, proxyEnv [][2]string) string {
+// renderSystemdUnitWithForwardedEnv renders the systemd unit using a forwarded
+// environment supplied by the caller (see serviceForwardedEnv).
+func renderSystemdUnitWithForwardedEnv(exe string, p *paths.Paths, home string, forwardedEnv [][2]string) string {
 	command := strings.Join([]string{
 		systemdEscapeArg(exe),
 		systemdEscapeArg("daemon"),
@@ -111,8 +111,10 @@ func renderSystemdUnitWithProxyEnv(exe string, p *paths.Paths, home string, prox
 		systemdEnvironmentLine("PATH", managedServicePath(home)),
 	}
 	// Forward proxy variables so the daemon (and the agents it spawns) can
-	// reach the network through the user's proxy. See serviceProxyEnv.
-	for _, kv := range proxyEnv {
+	// reach the network through the user's proxy, and telemetry variables so
+	// the daemon honors the opt-out set when the service was installed. See
+	// serviceForwardedEnv.
+	for _, kv := range forwardedEnv {
 		envLines = append(envLines, systemdEnvironmentLine(kv[0], kv[1]))
 	}
 	return fmt.Sprintf(`[Unit]

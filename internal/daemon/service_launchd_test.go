@@ -272,7 +272,7 @@ func TestInstallLaunchAgentDoesNotRemoveLegacyPlistForDifferentRoot(t *testing.T
 }
 
 func TestRenderLaunchAgentForwardsProxyEnv(t *testing.T) {
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
@@ -288,22 +288,23 @@ func TestRenderLaunchAgentForwardsProxyEnv(t *testing.T) {
 	}
 }
 
-// TestRenderLaunchAgentForwardsEveryProxyEnvKey guards that the renderer and
-// proxyEnvKeys cannot drift apart: every declared key handed to the renderer -
-// both the upper- and lower-case spellings - must reach the plist with its
-// exact value, paired correctly. The proxy environment is injected directly
-// rather than read from the process environment so the assertion is independent
-// of the host's env-var case sensitivity (it ran on Windows CI, where setting
-// both spellings to distinct values is impossible); serviceProxyEnv's own
-// platform-specific behaviour is covered by the TestServiceProxyEnv* tests.
-func TestRenderLaunchAgentForwardsEveryProxyEnvKey(t *testing.T) {
-	var proxyEnv [][2]string
-	for _, key := range proxyEnvKeys {
-		proxyEnv = append(proxyEnv, [2]string{key, "val-" + key})
+// TestRenderLaunchAgentForwardsEveryForwardedEnvKey guards that the renderer
+// and forwardedEnvKeys cannot drift apart: every declared key handed to the
+// renderer - proxy spellings in both cases plus the telemetry keys - must
+// reach the plist with its exact value, paired correctly. The forwarded
+// environment is injected directly rather than read from the process
+// environment so the assertion is independent of the host's env-var case
+// sensitivity (it ran on Windows CI, where setting both spellings to distinct
+// values is impossible); serviceForwardedEnv's own platform-specific behaviour
+// is covered by the TestServiceForwardedEnv* tests.
+func TestRenderLaunchAgentForwardsEveryForwardedEnvKey(t *testing.T) {
+	var forwardedEnv [][2]string
+	for _, key := range forwardedEnvKeys() {
+		forwardedEnv = append(forwardedEnv, [2]string{key, "val-" + key})
 	}
 
-	plist := renderLaunchAgentWithProxyEnv("/opt/no-mistakes/bin/no-mistakes", paths.WithRoot(t.TempDir()), "/home/u", proxyEnv)
-	for _, key := range proxyEnvKeys {
+	plist := renderLaunchAgentWithForwardedEnv("/opt/no-mistakes/bin/no-mistakes", paths.WithRoot(t.TempDir()), "/home/u", forwardedEnv)
+	for _, key := range forwardedEnvKeys() {
 		fragment := "<key>" + key + "</key>\n    <string>val-" + key + "</string>"
 		if !strings.Contains(plist, fragment) {
 			t.Fatalf("launch agent should forward %s as %q, got:\n%s", key, "val-"+key, plist)

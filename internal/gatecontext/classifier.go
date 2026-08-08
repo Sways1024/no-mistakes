@@ -157,12 +157,23 @@ func (i Inspector) activeAgentSteps() ([]activeAgentStep, error) {
 	}
 	runs, err := i.DB.GetActiveRuns()
 	if err != nil {
+		// A schema mismatch means this database predates the running binary's
+		// migrations, which only db.Open applies: no daemon of this version has
+		// ever opened it, so it cannot record an active step ancestry. Degrade
+		// to none so the read-only preflight does not starve the daemon start
+		// whose own db.Open migrates authoritatively (#655).
+		if db.IsSchemaMismatch(err) {
+			return nil, nil
+		}
 		return nil, fmt.Errorf("gate execution context: list active runs: %w", err)
 	}
 	var out []activeAgentStep
 	for _, run := range runs {
 		steps, err := i.DB.GetStepsByRun(run.ID)
 		if err != nil {
+			if db.IsSchemaMismatch(err) {
+				return nil, nil
+			}
 			return nil, fmt.Errorf("gate execution context: list steps for active run: %w", err)
 		}
 		for _, step := range steps {
@@ -204,6 +215,14 @@ func (i Inspector) registeredManagedCommonDir(commonDir string) (string, bool, e
 	}
 	repo, err := i.DB.GetRepo(id)
 	if err != nil {
+		// Same degrade as activeAgentSteps: a pre-migration schema proves no
+		// daemon of this version has ever opened this database, so any
+		// gate-shaped directory belongs to an older binary with no live
+		// executor to be nested inside; refusing here would permanently block
+		// the daemon start whose db.Open migrates the schema (#655).
+		if db.IsSchemaMismatch(err) {
+			return "", false, nil
+		}
 		return "", false, fmt.Errorf("gate execution context: verify managed gate: %w", err)
 	}
 	if repo == nil || !sameCanonicalPath(common, i.Paths.RepoDir(repo.ID)) {
