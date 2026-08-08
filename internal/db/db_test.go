@@ -2,6 +2,7 @@ package db
 
 import (
 	"database/sql"
+	"errors"
 	"os"
 	"path/filepath"
 	"testing"
@@ -361,5 +362,37 @@ func TestOpenWaitsForTransientMigrationLock(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Open did not finish after the migration lock was released")
+	}
+}
+
+func TestIsSchemaMismatchRecognizesPreMigrationReadFailures(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "legacy.sqlite")
+	legacy, err := sql.Open("sqlite", path)
+	if err != nil {
+		t.Fatalf("open legacy db: %v", err)
+	}
+	if _, err := legacy.Exec(`CREATE TABLE runs (id TEXT PRIMARY KEY, status TEXT NOT NULL)`); err != nil {
+		t.Fatalf("create legacy runs table: %v", err)
+	}
+	if err := legacy.Close(); err != nil {
+		t.Fatalf("close legacy db: %v", err)
+	}
+
+	database, err := OpenReadOnly(path)
+	if err != nil {
+		t.Fatalf("OpenReadOnly: %v", err)
+	}
+	defer database.Close()
+	if _, err := database.GetActiveRuns(); !IsSchemaMismatch(err) {
+		t.Fatalf("GetActiveRuns on legacy schema = %v, want schema mismatch", err)
+	}
+	if _, err := database.GetRepo("any"); !IsSchemaMismatch(err) {
+		t.Fatalf("GetRepo without repos table = %v, want schema mismatch", err)
+	}
+	if IsSchemaMismatch(nil) {
+		t.Fatal("nil error classified as schema mismatch")
+	}
+	if IsSchemaMismatch(errors.New("database is locked")) {
+		t.Fatal("unrelated error classified as schema mismatch")
 	}
 }

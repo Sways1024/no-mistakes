@@ -72,6 +72,19 @@ func isDuplicateColumnErr(err error) bool {
 	return strings.Contains(err.Error(), "duplicate column name")
 }
 
+// IsSchemaMismatch reports whether err is SQLite's "no such column" or "no
+// such table" error, which statements emit against a database created by an
+// older binary before this binary's migrations ran. Only Open migrates;
+// read-only callers that must not migrate use this signal to degrade instead
+// of failing.
+func IsSchemaMismatch(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "no such column") || strings.Contains(msg, "no such table")
+}
+
 // Close closes the database connection.
 func (d *DB) Close() error {
 	return d.sql.Close()
