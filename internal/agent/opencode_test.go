@@ -3,11 +3,14 @@ package agent
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestOpencodeAgent_CloseWithoutServer(t *testing.T) {
@@ -518,5 +521,294 @@ func TestOpencodeAgent_StructuredOutputError(t *testing.T) {
 	}
 	if strings.Contains(msg, "Now I need to find the failing test") {
 		t.Errorf("error must not embed the reasoning prose snippet, got %q", msg)
+	}
+}
+
+// runOpencodeBounded runs a.Run in a goroutine and fails the test if it does
+// not return within a generous bound — the #674 regression mode is an
+// indefinite silent hang, which must surface as a test failure, not a suite
+// timeout.
+func runOpencodeBounded(t *testing.T, a *opencodeAgent, opts RunOpts) (*Result, error) {
+	t.Helper()
+	type runReturn struct {
+		result *Result
+		err    error
+	}
+	done := make(chan runReturn, 1)
+	go func() {
+		result, err := a.Run(context.Background(), opts)
+		done <- runReturn{result: result, err: err}
+	}()
+	select {
+	case rr := <-done:
+		return rr.result, rr.err
+	case <-time.After(10 * time.Second):
+		t.Fatal("opencode Run did not return within 10s")
+		return nil, nil
+	}
+}
+
+// TestOpencodeAgent_MessageErrorWhileStreamSilentFailsFast asserts that a
+// failed message POST surfaces immediately even while the event stream stays
+// open and silent. Before #674 the step blocked in the SSE parse waiting for
+// a session.idle that could never arrive.
+func TestOpencodeAgent_MessageErrorWhileStreamSilentFailsFast(t *testing.T) {
+	aborted := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/session" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"id":"s1"}`)
+
+		case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done() // stream stays open, emits nothing
+
+		case r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost:
+			http.Error(w, "provider exploded", http.StatusBadGateway)
+
+		case r.URL.Path == "/session/s1/abort" && r.Method == http.MethodPost:
+			select {
+			case aborted <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	a := &opencodeAgent{
+		bin:    "opencode",
+		server: &managedServer{port: mustParsePort(server.URL)},
+	}
+
+	result, err := runOpencodeBounded(t, a, RunOpts{Prompt: "hello", CWD: t.TempDir()})
+	if err == nil {
+		t.Fatalf("expected error, got result %+v", result)
+	}
+	if !strings.Contains(err.Error(), "opencode message") {
+		t.Errorf("expected message error, got %q", err.Error())
+	}
+	if !strings.Contains(err.Error(), "502") {
+		t.Errorf("expected 502 status in error, got %q", err.Error())
+	}
+	select {
+	case <-aborted:
+	default:
+		t.Error("expected session abort after message failure")
+	}
+}
+
+// TestOpencodeAgent_EventSilenceWatchdogAbortsWithDiagnostic asserts that a
+// stream delivering no events at all for the idle bound fails the attempt
+// with a diagnostic instead of hanging forever (#674: provider call wedged
+// after accepting the message, so neither the message POST nor session.idle
+// ever completes).
+func TestOpencodeAgent_EventSilenceWatchdogAbortsWithDiagnostic(t *testing.T) {
+	aborted := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/session" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"id":"s1"}`)
+
+		case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done() // stream stays open, emits nothing
+
+		case r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost:
+			// Drain the body so the server's background read can observe the
+			// client disconnect and cancel the request context.
+			io.Copy(io.Discard, r.Body)
+			<-r.Context().Done() // provider wedged: the POST never returns
+
+		case r.URL.Path == "/session/s1/abort" && r.Method == http.MethodPost:
+			select {
+			case aborted <- struct{}{}:
+			default:
+			}
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	a := &opencodeAgent{
+		bin:              "opencode",
+		eventIdleTimeout: 100 * time.Millisecond,
+		server:           &managedServer{port: mustParsePort(server.URL)},
+	}
+
+	var events []LifecycleEvent
+	result, err := runOpencodeBounded(t, a, RunOpts{
+		Prompt:      "hello",
+		CWD:         t.TempDir(),
+		OnLifecycle: func(event LifecycleEvent) { events = append(events, event) },
+	})
+	if err == nil {
+		t.Fatalf("expected error, got result %+v", result)
+	}
+	if !strings.Contains(err.Error(), "opencode produced no events for 100ms") {
+		t.Errorf("expected event-silence diagnostic, got %q", err.Error())
+	}
+	select {
+	case <-aborted:
+	default:
+		t.Error("expected session abort after watchdog fired")
+	}
+	if len(events) == 0 || events[len(events)-1].Phase != LifecyclePhaseExit {
+		t.Fatalf("expected trailing exit lifecycle event, got %+v", events)
+	}
+	if !strings.Contains(events[len(events)-1].Message, "produced no events") {
+		t.Errorf("expected exit event to carry the diagnostic, got %q", events[len(events)-1].Message)
+	}
+}
+
+// TestOpencodeAgent_CreateSessionTimesOutInsteadOfHanging asserts the
+// control-plane session create is bounded: a server that accepts the request
+// and never answers must fail the attempt, not hang the step (#674).
+func TestOpencodeAgent_CreateSessionTimesOutInsteadOfHanging(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/session" && r.Method == http.MethodPost {
+			// Drain the body so the server's background read can observe the
+			// client disconnect and cancel the request context.
+			io.Copy(io.Discard, r.Body)
+			<-r.Context().Done() // never answers
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer server.Close()
+
+	a := &opencodeAgent{
+		bin:            "opencode",
+		controlTimeout: 100 * time.Millisecond,
+		server:         &managedServer{port: mustParsePort(server.URL)},
+	}
+
+	result, err := runOpencodeBounded(t, a, RunOpts{Prompt: "hello", CWD: t.TempDir()})
+	if err == nil {
+		t.Fatalf("expected error, got result %+v", result)
+	}
+	if !strings.Contains(err.Error(), "opencode create session") {
+		t.Errorf("expected create-session error, got %q", err.Error())
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Errorf("expected deadline error, got %q", err.Error())
+	}
+}
+
+// TestOpencodeAgent_ProceedsWithResponseWhenIdleNeverArrives asserts that a
+// completed message response is not held hostage by a stream that never
+// delivers session.idle: after a short grace window the attempt proceeds
+// with the response, preserving the backfill emit path.
+func TestOpencodeAgent_ProceedsWithResponseWhenIdleNeverArrives(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/session" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"id":"s1"}`)
+
+		case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.WriteHeader(http.StatusOK)
+			w.(http.Flusher).Flush()
+			<-r.Context().Done() // stream stays open, never emits session.idle
+
+		case r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"info":{"id":"msg1","role":"assistant","tokens":{"input":100,"output":50}},"parts":[{"type":"text","text":"hello world"}]}`)
+
+		case r.URL.Path == "/session/s1" && r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	a := &opencodeAgent{
+		bin:             "opencode",
+		idleGracePeriod: 50 * time.Millisecond,
+		server:          &managedServer{port: mustParsePort(server.URL)},
+	}
+
+	var chunks []string
+	result, err := runOpencodeBounded(t, a, RunOpts{
+		Prompt:  "hello",
+		CWD:     t.TempDir(),
+		OnChunk: func(text string) { chunks = append(chunks, text) },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if result.Text != "hello world" {
+		t.Fatalf("expected response text, got %q", result.Text)
+	}
+	if got := strings.Join(chunks, ""); got != "hello world" {
+		t.Fatalf("expected backfilled response text, got %q from %v", got, chunks)
+	}
+	if result.Usage.InputTokens != 100 || result.Usage.OutputTokens != 50 {
+		t.Fatalf("expected usage from message response, got %+v", result.Usage)
+	}
+}
+
+// TestOpencodeAgent_EmitsServerLifecycleEvents asserts each attempt emits
+// start/exit lifecycle events carrying the managed-server identity, so the
+// pipeline executor populates agent_pid and last_activity for opencode steps
+// exactly like subprocess adapters (#674: agent_pid was always empty).
+func TestOpencodeAgent_EmitsServerLifecycleEvents(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.URL.Path == "/session" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"id":"s1"}`)
+
+		case r.URL.Path == "/global/event" && r.Method == http.MethodGet:
+			w.Header().Set("Content-Type", "text/event-stream")
+			fmt.Fprint(w, "data: {\"payload\":{\"type\":\"session.idle\"}}\n\n")
+
+		case r.URL.Path == "/session/s1/message" && r.Method == http.MethodPost:
+			fmt.Fprint(w, `{"info":{"id":"msg1","role":"assistant"},"parts":[{"type":"text","text":"done"}]}`)
+
+		case r.URL.Path == "/session/s1" && r.Method == http.MethodDelete:
+			w.WriteHeader(http.StatusOK)
+
+		default:
+			w.WriteHeader(http.StatusOK)
+		}
+	}))
+	defer server.Close()
+
+	a := &opencodeAgent{
+		bin:    "opencode",
+		server: &managedServer{port: mustParsePort(server.URL)},
+	}
+
+	var events []LifecycleEvent
+	_, err := a.Run(context.Background(), RunOpts{
+		Prompt:      "hello",
+		CWD:         t.TempDir(),
+		OnLifecycle: func(event LifecycleEvent) { events = append(events, event) },
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(events) != 2 {
+		t.Fatalf("expected start and exit lifecycle events, got %+v", events)
+	}
+	if events[0].Phase != LifecyclePhaseStart || events[0].Agent != "opencode" {
+		t.Errorf("expected opencode start event first, got %+v", events[0])
+	}
+	if events[1].Phase != LifecyclePhaseExit || events[1].Agent != "opencode" {
+		t.Errorf("expected opencode exit event last, got %+v", events[1])
+	}
+	if !strings.Contains(events[1].Message, "status=success") {
+		t.Errorf("expected success exit message, got %q", events[1].Message)
 	}
 }

@@ -175,6 +175,13 @@ func TestInit(t *testing.T) {
 	} else if got := string(out); got != "true\n" {
 		t.Fatalf("receive.advertisePushOptions = %q, want true", got)
 	}
+	// Custody recovery anchors a rewritten-away preserved head from the gate by
+	// exact SHA (branchsync.Recover --keep-local, issue #642).
+	if out, err := exec.Command("git", "-C", bareDir, "config", "--get", "uploadpack.allowAnySHA1InWant").Output(); err != nil {
+		t.Fatalf("get uploadpack.allowAnySHA1InWant: %v", err)
+	} else if got := string(out); got != "true\n" {
+		t.Fatalf("uploadpack.allowAnySHA1InWant = %q, want true", got)
+	}
 
 	// Verify no-mistakes remote was added to working repo.
 	url, err := gitpkg.GetRemoteURL(ctx, workDir, "no-mistakes")

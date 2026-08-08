@@ -308,8 +308,10 @@ func MarkGateConfigCurrent(bareDir string) error {
 }
 
 func gateConfigStampContent() string {
-	sum := sha256.Sum256([]byte("gate-config-v2\x00" + PreReceiveHookScript() + "\x00" + PostReceiveHookScript()))
-	return fmt.Sprintf("v2:%x\n", sum)
+	// v3: gates additionally set uploadpack.allowAnySHA1InWant so custody
+	// recovery can anchor a rewritten-away preserved head by exact SHA (#642).
+	sum := sha256.Sum256([]byte("gate-config-v3\x00" + PreReceiveHookScript() + "\x00" + PostReceiveHookScript()))
+	return fmt.Sprintf("v3:%x\n", sum)
 }
 
 // IsolateHooksPath protects the gate's post-receive hook from being

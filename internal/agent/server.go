@@ -129,6 +129,15 @@ func (s *managedServer) baseURL() string {
 	return fmt.Sprintf("http://127.0.0.1:%d", s.port)
 }
 
+// pid returns the managed server's process ID, or 0 when no process is
+// tracked (tests inject a bare managedServer).
+func (s *managedServer) pid() int {
+	if s.cmd == nil || s.cmd.Process == nil {
+		return 0
+	}
+	return s.cmd.Process.Pid
+}
+
 // formatHealthTimeout renders a health-check deadline for error messages,
 // preferring a plain seconds form (e.g. "60s") over Duration's "1m0s".
 func formatHealthTimeout(d time.Duration) string {

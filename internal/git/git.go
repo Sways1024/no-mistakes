@@ -468,6 +468,18 @@ func FetchRemoteBranchToPrivateRef(ctx context.Context, dir, remote, branch, loc
 	return err
 }
 
+// FetchRemoteSHAToPrivateRef fetches one exact commit into a caller-owned
+// private ref without touching FETCH_HEAD or ordinary remote-tracking refs.
+// The remote must permit unadvertised-object fetches: the no-mistakes gate
+// enables uploadpack.allowAnySHA1InWant at provision time exactly so custody
+// recovery can anchor a preserved head that a rewritten fix-round commit left
+// as no branch's tip (issue #642).
+func FetchRemoteSHAToPrivateRef(ctx context.Context, dir, remote, sha, localRef string) error {
+	refspec := fmt.Sprintf("+%s:%s", sha, localRef)
+	_, err := Run(ctx, dir, "fetch", "--no-tags", "--no-write-fetch-head", remote, refspec)
+	return err
+}
+
 // Push pushes HEAD to a remote ref. If forceWithLease is true, it uses an
 // explicit expected remote SHA for safe force-push.
 func Push(ctx context.Context, dir, remote, ref, expectedSHA string, forceWithLease bool) error {

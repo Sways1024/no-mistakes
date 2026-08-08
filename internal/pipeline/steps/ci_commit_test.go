@@ -50,7 +50,7 @@ func TestCIStep_CommitAndPush(t *testing.T) {
 	}
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +112,7 @@ func TestCIStep_CommitAndPushTargetsForkWhenConfigured(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -154,7 +154,7 @@ func TestCIStep_CommitAndPushRedactsForkURLInGitErrors(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err == nil {
 		t.Fatal("expected push error")
 	}
@@ -179,7 +179,7 @@ func TestCIStep_CommitAndPush_NoChanges(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -211,7 +211,7 @@ func TestCIStep_CommitAndPush_StatusError(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err == nil {
 		t.Fatal("expected status error")
 	}
@@ -285,7 +285,7 @@ func TestCIStep_CommitAndPush_UsesStepEnvForAllGitCommands(t *testing.T) {
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -361,7 +361,7 @@ func TestCIStep_CommitAndPush_GitCommandsUseStandardCredentialEnv(t *testing.T) 
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -402,7 +402,7 @@ func TestCIStep_CommitAndPush_NoChanges_ReconcilesStaleDatabaseHeadSHA(t *testin
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -465,7 +465,7 @@ func TestCIStep_CommitAndPush_NoChanges_ReconcilesStaleDatabaseHeadSHA_UsesStepE
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -520,7 +520,7 @@ func TestCIStep_CommitAndPush_NoDirtyChangesButHeadAdvanced_PushesNewHead(t *tes
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -576,7 +576,7 @@ func TestCIStep_CommitAndPush_UpdatesLocalBranchRefAfterDetachedPush(t *testing.
 	sctx.Run.Branch = "refs/heads/feature"
 
 	step := &CIStep{}
-	pushed, err := step.commitAndPush(sctx)
+	pushed, err := step.commitAndPush(sctx, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -591,5 +591,133 @@ func TestCIStep_CommitAndPush_UpdatesLocalBranchRefAfterDetachedPush(t *testing.
 	upstreamSHA := gitCmd(t, upstream, "rev-parse", "refs/heads/feature")
 	if upstreamSHA != newHeadSHA {
 		t.Fatalf("upstream SHA = %s, want %s", upstreamSHA, newHeadSHA)
+	}
+}
+
+// TestCIStep_CommitAndPush_RefusesAmendedHeadOutsideInstructedRebase is the CI
+// analogue of the commitAgentFixes continuity guard (issue #642): a fix agent
+// that amended the recorded head instead of appending leaves HEAD off the
+// recorded lineage, and commitAndPush must refuse before committing on,
+// pushing, or recording the rewritten head. Only the instructed merge-conflict
+// rebase round (rewriteExpected=true) may rewrite history.
+func TestCIStep_CommitAndPush_RefusesAmendedHeadOutsideInstructedRebase(t *testing.T) {
+	t.Parallel()
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+
+	dir := t.TempDir()
+	gitCmd(t, dir, "init")
+	gitCmd(t, dir, "config", "user.name", "test")
+	gitCmd(t, dir, "config", "user.email", "test@test.com")
+	gitCmd(t, dir, "checkout", "-b", "main")
+	os.WriteFile(filepath.Join(dir, "init.txt"), []byte("init"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "initial")
+	baseSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+
+	gitCmd(t, dir, "checkout", "-b", "feature")
+	os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "feature")
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	// The CI fix agent amends the recorded head instead of appending.
+	os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature amended"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "--amend", "--no-edit")
+	amendedSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	if amendedSHA == headSHA {
+		t.Fatal("test setup: amend did not rewrite the head")
+	}
+	os.WriteFile(filepath.Join(dir, "fix.txt"), []byte("ci fix"), 0o644)
+
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Run.Branch = "refs/heads/feature"
+
+	step := &CIStep{}
+	pushed, err := step.commitAndPush(sctx, false)
+	if err == nil {
+		t.Fatalf("expected commitAndPush to refuse the amended head, got pushed=%v err=nil", pushed)
+	}
+	if !strings.Contains(err.Error(), "not a descendant") {
+		t.Fatalf("expected a head-divergence error, got: %v", err)
+	}
+	if pushed {
+		t.Fatal("expected no push when refusing")
+	}
+	// Nothing was committed on the rewritten head, nothing was pushed, and the
+	// recorded head is unchanged.
+	if got := gitCmd(t, dir, "rev-parse", "HEAD"); got != amendedSHA {
+		t.Fatalf("HEAD = %s, want untouched amended head %s", got, amendedSHA)
+	}
+	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != headSHA {
+		t.Fatalf("origin feature = %s, want recorded head %s preserved", got, headSHA)
+	}
+	if sctx.Run.HeadSHA != headSHA {
+		t.Fatalf("Run.HeadSHA = %s, want recorded head %s preserved", sctx.Run.HeadSHA, headSHA)
+	}
+}
+
+// TestCIStep_CommitAndPush_AllowsInstructedRebaseRewrite pins the deliberate
+// exemption: a merge-conflict round is instructed to rebase, whose head is by
+// construction not a descendant of the recorded head, so rewriteExpected=true
+// skips the continuity guard and the round's remote safety stays owned by
+// resolveForcePushDecision.
+func TestCIStep_CommitAndPush_AllowsInstructedRebaseRewrite(t *testing.T) {
+	t.Parallel()
+	upstream := t.TempDir()
+	gitCmd(t, upstream, "init", "--bare")
+
+	dir := t.TempDir()
+	gitCmd(t, dir, "init")
+	gitCmd(t, dir, "config", "user.name", "test")
+	gitCmd(t, dir, "config", "user.email", "test@test.com")
+	gitCmd(t, dir, "checkout", "-b", "main")
+	os.WriteFile(filepath.Join(dir, "init.txt"), []byte("init"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "initial")
+	baseSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	gitCmd(t, dir, "remote", "add", "origin", upstream)
+	gitCmd(t, dir, "push", "origin", "main")
+
+	gitCmd(t, dir, "checkout", "-b", "feature")
+	os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "-m", "feature")
+	headSHA := gitCmd(t, dir, "rev-parse", "HEAD")
+	gitCmd(t, dir, "push", "origin", "feature")
+
+	// The instructed rebase rewrote the branch history (modelled by an amend:
+	// the new head is not a descendant of the recorded head) and left resolved
+	// changes in the worktree.
+	os.WriteFile(filepath.Join(dir, "feature.txt"), []byte("feature rebased"), 0o644)
+	gitCmd(t, dir, "add", "-A")
+	gitCmd(t, dir, "commit", "--amend", "--no-edit")
+	os.WriteFile(filepath.Join(dir, "resolved.txt"), []byte("resolved"), 0o644)
+
+	ag := &mockAgent{name: "test"}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Repo.UpstreamURL = upstream
+	sctx.Run.Branch = "refs/heads/feature"
+
+	step := &CIStep{}
+	pushed, err := step.commitAndPush(sctx, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !pushed {
+		t.Fatal("expected the instructed rebase round to commit and push")
+	}
+	newHead := gitCmd(t, dir, "rev-parse", "HEAD")
+	if got := gitCmd(t, upstream, "rev-parse", "refs/heads/feature"); got != newHead {
+		t.Fatalf("origin feature = %s, want rebased head %s", got, newHead)
+	}
+	if sctx.Run.HeadSHA != newHead {
+		t.Fatalf("Run.HeadSHA = %s, want %s", sctx.Run.HeadSHA, newHead)
 	}
 }

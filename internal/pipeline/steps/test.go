@@ -51,6 +51,7 @@ Context:
 Rules:
 - Make the smallest correct root-cause fix.
 - Do not refactor beyond what is needed for that root-cause fix.
+- Never amend, rebase, or otherwise rewrite existing commits; if you commit at all, only append new commits. A rewritten head invalidates the run's recorded history and fails the run.
 - If tests fail, determine whether the problem is a real product/code failure, a setup/environment problem you can fix, or a flaky/infrastructure issue.
 - Do NOT run linters, formatters, or static analysis tools.
 - Reproduce the specific failing case first (the exact test, package, script, or check named in the findings), then re-run only that focused verification after the fix.

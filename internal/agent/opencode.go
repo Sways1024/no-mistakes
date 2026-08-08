@@ -3,17 +3,59 @@ package agent
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 )
+
+// opencodeEventIdleTimeout bounds total event-stream silence during a turn.
+// Real opencode activity emits step/delta events continuously, so a stream
+// that delivers nothing at all for this long means the provider call wedged
+// after accepting the message and session.idle will never arrive; without
+// this bound the step hangs forever with no diagnostic (#674).
+const opencodeEventIdleTimeout = 10 * time.Minute
+
+// opencodeIdleGracePeriod is how long a completed message response waits for
+// the stream's trailing session.idle (and final usage events) before
+// proceeding with the response.
+const opencodeIdleGracePeriod = 5 * time.Second
+
+// opencodeControlTimeout bounds control-plane HTTP calls (session create).
+// The message POST deliberately stays unbounded: it blocks for the whole
+// agent turn.
+const opencodeControlTimeout = 30 * time.Second
 
 // opencodeAgent starts a persistent HTTP server via `opencode serve`
 // and sends requests via REST with SSE streaming.
 type opencodeAgent struct {
 	bin       string
 	extraArgs []string
-	mu        sync.Mutex
-	server    *managedServer
+	// eventIdleTimeout, idleGracePeriod, and controlTimeout override the
+	// package defaults when positive; tests use them to keep waits short.
+	eventIdleTimeout time.Duration
+	idleGracePeriod  time.Duration
+	controlTimeout   time.Duration
+	mu               sync.Mutex
+	server           *managedServer
+}
+
+// idleResetReader re-arms the event-stream inactivity watchdog whenever the
+// underlying stream delivers bytes, so the watchdog measures true event
+// silence rather than total turn duration.
+type idleResetReader struct {
+	r       io.Reader
+	timer   *time.Timer
+	timeout time.Duration
+}
+
+func (r *idleResetReader) Read(p []byte) (int, error) {
+	n, err := r.r.Read(p)
+	if n > 0 {
+		r.timer.Reset(r.timeout)
+	}
+	return n, err
 }
 
 func (a *opencodeAgent) Name() string { return "opencode" }
@@ -46,6 +88,26 @@ func (a *opencodeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, err
 		return nil, err
 	}
 
+	// The managed server is the only process behind an opencode attempt, so
+	// its PID is the liveness identity surfaced as agent_pid. Without these
+	// events opencode steps report no PID and no activity at all (#674).
+	pid := a.serverPID()
+	emitAgentStarted(opts, "opencode", pid)
+	result, err := a.runSession(ctx, opts, baseURL)
+	emitAgentExited(opts, "opencode", pid, err)
+	return result, err
+}
+
+func (a *opencodeAgent) serverPID() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if a.server == nil {
+		return 0
+	}
+	return a.server.pid()
+}
+
+func (a *opencodeAgent) runSession(ctx context.Context, opts RunOpts, baseURL string) (*Result, error) {
 	// Create session with blanket permissions
 	sessionID, err := a.createSession(ctx, baseURL, opts.CWD)
 	if err != nil {
@@ -82,33 +144,90 @@ func (a *opencodeAgent) runOnce(ctx context.Context, opts RunOpts) (*Result, err
 		msgCh <- messageResult{resp: resp, err: err}
 	}()
 
-	// Process SSE events until session.idle
+	// Process SSE events until session.idle. Parsing runs in its own
+	// goroutine so a failed message POST or total event silence cannot leave
+	// the step blocked forever on a stream that will never deliver
+	// session.idle (#674). An inactivity watchdog cancels the stream when no
+	// bytes arrive for the idle bound. Every exit path below drains sseCh
+	// before touching state, so the parse goroutine never races the response
+	// merge.
 	state := &opencodeStreamState{
 		sessionID:  sessionID,
 		onChunk:    opts.OnChunk,
 		textParts:  make(map[string]*opencodeTextPart),
 		usageByMsg: make(map[string]TokenUsage),
 	}
-	err = parseOpencodeSSE(eventBody, state)
-	streamCancel()
-
-	if err != nil {
-		// Check if message request failed
-		select {
-		case mr := <-msgCh:
-			if mr.err != nil {
-				return nil, fmt.Errorf("opencode message: %w", mr.err)
-			}
-		default:
-		}
-		a.abortSession(baseURL, sessionID)
-		return nil, fmt.Errorf("opencode events: %w", err)
+	idleTimeout := a.eventIdleTimeout
+	if idleTimeout <= 0 {
+		idleTimeout = opencodeEventIdleTimeout
 	}
+	var watchdogFired atomic.Bool
+	watchdog := time.AfterFunc(idleTimeout, func() {
+		watchdogFired.Store(true)
+		streamCancel()
+	})
+	defer watchdog.Stop()
+	sseCh := make(chan error, 1)
+	go func() {
+		sseCh <- parseOpencodeSSE(&idleResetReader{r: eventBody, timer: watchdog, timeout: idleTimeout}, state)
+	}()
 
-	// Wait for message response
-	mr := <-msgCh
-	if mr.err != nil {
-		return nil, fmt.Errorf("opencode message: %w", mr.err)
+	var mr messageResult
+	select {
+	case sseErr := <-sseCh:
+		streamCancel()
+		if sseErr != nil {
+			// Check if message request failed
+			select {
+			case mr := <-msgCh:
+				if mr.err != nil {
+					return nil, fmt.Errorf("opencode message: %w", mr.err)
+				}
+			default:
+			}
+			a.abortSession(baseURL, sessionID)
+			if watchdogFired.Load() {
+				return nil, fmt.Errorf("opencode produced no events for %s", idleTimeout)
+			}
+			return nil, fmt.Errorf("opencode events: %w", sseErr)
+		}
+
+		// Wait for message response
+		mr = <-msgCh
+		if mr.err != nil {
+			return nil, fmt.Errorf("opencode message: %w", mr.err)
+		}
+
+	case mr = <-msgCh:
+		if mr.err != nil {
+			// The message POST failed while the stream stayed open, so
+			// session.idle will never arrive for this session; abort and
+			// surface the message error immediately instead of waiting on
+			// the stream.
+			a.abortSession(baseURL, sessionID)
+			streamCancel()
+			<-sseCh
+			return nil, fmt.Errorf("opencode message: %w", mr.err)
+		}
+		// The response is complete; give the stream a short grace window to
+		// deliver session.idle plus trailing usage events, then proceed with
+		// the response.
+		gracePeriod := a.idleGracePeriod
+		if gracePeriod <= 0 {
+			gracePeriod = opencodeIdleGracePeriod
+		}
+		grace := time.NewTimer(gracePeriod)
+		defer grace.Stop()
+		select {
+		case sseErr := <-sseCh:
+			if sseErr != nil && !watchdogFired.Load() {
+				a.abortSession(baseURL, sessionID)
+				return nil, fmt.Errorf("opencode events: %w", sseErr)
+			}
+		case <-grace.C:
+			streamCancel()
+			<-sseCh
+		}
 	}
 
 	// Update usage and text from message response

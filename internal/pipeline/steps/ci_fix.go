@@ -53,11 +53,13 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 		- If a test is flaky, make it deterministic.
 		- Make the smallest correct root-cause fix.
 		- Do not refactor beyond what is needed for that root-cause fix.
+		- The instructed rebase onto the base branch is the only permitted history rewrite; never amend or squash existing commits beyond it.
 		- Verify the fix by running the most relevant commands locally before finishing.`
 	case mergeConflict:
 		promptIntro = "The PR has merge conflicts with the base branch. Rebase onto the base branch and resolve the merge conflicts."
 		promptRules = `- Resolve the merge conflicts by applying the minimal necessary changes.
 		- Do not make unrelated file edits.
+		- The instructed rebase onto the base branch is the only permitted history rewrite; never amend or squash existing commits beyond it.
 		- Verify the rebase completes cleanly before finishing.`
 	default:
 		promptIntro = "The following CI checks have failed on this PR. Diagnose and fix the issues."
@@ -66,6 +68,7 @@ func (s *CIStep) autoFixCI(sctx *pipeline.StepContext, host scm.Host, pr *scm.PR
 		- If a test is flaky, make it deterministic.
 		- Make the smallest correct root-cause fix.
 		- Do not refactor beyond what is needed for that root-cause fix.
+		- Never amend, rebase, or otherwise rewrite existing commits; if you commit at all, only append new commits.
 		- Verify the fix by running the most relevant commands locally before finishing.`
 	}
 
@@ -113,14 +116,29 @@ CI logs:
 		return false, fmt.Errorf("agent CI fix: %w", err)
 	}
 
-	return s.commitAndPush(sctx)
+	return s.commitAndPush(sctx, mergeConflict)
 }
 
 // commitAndPush commits any uncommitted changes and force-pushes to the
 // configured push remote.
 // Returns (true, nil) when changes were pushed, (false, nil) when there was
 // nothing to commit, or (false, err) on failure.
-func (s *CIStep) commitAndPush(sctx *pipeline.StepContext) (bool, error) {
+//
+// rewriteExpected reports that this fix round was instructed to rebase onto
+// the base branch (a merge-conflict round), whose head is by construction not
+// a descendant of the recorded head; only that round skips the continuity
+// guard, and its remote-clobber safety stays owned by resolveForcePushDecision
+// in pushUpdatedHeadSHA. Every other round is append-only, so an agent that
+// amended or otherwise rewrote the recorded history fails here before the
+// rewritten head can be committed on, pushed, or recorded (issue #642).
+func (s *CIStep) commitAndPush(sctx *pipeline.StepContext, rewriteExpected bool) (bool, error) {
+	if !rewriteExpected {
+		if err := assertPipelineHeadContinuityWith(sctx, s.Name(), func(args ...string) (string, error) {
+			return stepGitRun(sctx, args...)
+		}); err != nil {
+			return false, err
+		}
+	}
 	status, err := stepGitRun(sctx, "status", "--porcelain")
 	if err != nil {
 		return false, fmt.Errorf("check CI changes: %w", err)

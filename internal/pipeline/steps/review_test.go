@@ -747,3 +747,37 @@ func mustLatestRoundID(t *testing.T, sctx *pipeline.StepContext) string {
 	}
 	return rounds[len(rounds)-1].ID
 }
+
+// TestReviewStep_FixMode_ForbidsHistoryRewrites pins the append-only rule in
+// the fix-session prompt (issue #642): an amended fix-round commit strands the
+// run behind the head-continuity guard, so the fixer must never rewrite
+// existing commits. The rule is a prompt contract; the runtime enforcement is
+// assertPipelineHeadContinuity.
+func TestReviewStep_FixMode_ForbidsHistoryRewrites(t *testing.T) {
+	t.Parallel()
+	dir, baseSHA, headSHA := setupGitRepo(t)
+	gitCmd(t, dir, "checkout", "--detach", headSHA)
+
+	ag := &mockAgent{
+		name: "test",
+		runFn: func(ctx context.Context, opts agent.RunOpts) (*agent.Result, error) {
+			j, _ := json.Marshal(Findings{Summary: "clean"})
+			return &agent.Result{Output: j}, nil
+		},
+	}
+	sctx := newTestContextWithDBRecords(t, ag, dir, baseSHA, headSHA, config.Commands{})
+	sctx.Fixing = true
+	sctx.PreviousFindings = `{"findings":[{"id":"review-1","severity":"warning","file":"main.go","description":"possible nil deref"}],"summary":"1 issue"}`
+
+	step := &ReviewStep{}
+	if _, err := step.Execute(sctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(ag.calls) == 0 {
+		t.Fatal("expected the fixer to be invoked")
+	}
+	want := "Never amend, rebase, or otherwise rewrite existing commits; if you commit at all, only append new commits."
+	if !strings.Contains(ag.calls[0].Prompt, want) {
+		t.Errorf("expected fixer prompt to contain %q, got:\n%s", want, ag.calls[0].Prompt)
+	}
+}

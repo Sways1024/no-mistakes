@@ -41,6 +41,9 @@ type CIStep struct {
 	lastFixedCompletedAt map[string]time.Time // terminally failed check completion times seen before the last fix attempt
 	ciFixAttempts        int                  // number of CI auto-fix attempts made
 	transientReruns      checkRerunBudget     // per-check rerun budget spent on provider-reported transient failures
+	prStateErrs          pollErrStreak        // consecutive identical GetPRState poll failures
+	mergeableErrs        pollErrStreak        // consecutive identical GetMergeableState poll failures
+	checkErrs            pollErrStreak        // consecutive identical GetChecks poll failures
 	pollIntervalOverride time.Duration        // if set, overrides computed poll interval (for testing)
 	waitForNextPoll      func(context.Context, time.Duration) error
 	now                  func() time.Time
@@ -256,21 +259,28 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 		if err != nil {
 			sctx.Log(fmt.Sprintf("warning: could not check PR state: %v", err))
 			prStateKnown = false
-		} else if state == scm.PRStateMerged {
-			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
-				return nil, err
+			if s.prStateErrs.observe(now(), err) {
+				return ciPersistentPollErrorOutcome("PR state", &s.prStateErrs, now()), nil
 			}
-			sctx.Log("PR has been merged!")
-			return &pipeline.StepOutcome{}, nil
-		} else if state == scm.PRStateClosed {
-			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "closed"); err != nil {
-				return nil, err
-			}
-			sctx.Log("PR has been closed")
-			return &pipeline.StepOutcome{}, nil
-		} else if state == scm.PRStateOpen {
-			if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "open"); err != nil {
-				return nil, err
+		} else {
+			s.prStateErrs.reset()
+			switch state {
+			case scm.PRStateMerged:
+				if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "merged"); err != nil {
+					return nil, err
+				}
+				sctx.Log("PR has been merged!")
+				return &pipeline.StepOutcome{}, nil
+			case scm.PRStateClosed:
+				if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "closed"); err != nil {
+					return nil, err
+				}
+				sctx.Log("PR has been closed")
+				return &pipeline.StepOutcome{}, nil
+			case scm.PRStateOpen:
+				if err := sctx.DB.UpdateRunPRState(sctx.Run.ID, "open"); err != nil {
+					return nil, err
+				}
 			}
 		}
 
@@ -283,7 +293,11 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 				sctx.Log(fmt.Sprintf("warning: could not check mergeable state: %v", mergeErr))
 				mergeabilityBlockedReason = ""
 				mergeabilityKnown = false
+				if s.mergeableErrs.observe(now(), mergeErr) {
+					return ciPersistentPollErrorOutcome("mergeable state", &s.mergeableErrs, now()), nil
+				}
 			} else {
+				s.mergeableErrs.reset()
 				mergeConflict = mergeState.Conflict()
 				mergeabilityKnown = mergeState.Resolved()
 				if !mergeabilityKnown {
@@ -303,7 +317,11 @@ func (s *CIStep) Execute(sctx *pipeline.StepContext) (*pipeline.StepOutcome, err
 			clearCIMonitorReady(sctx)
 			lastMonitorLog = ""
 			sctx.Log(fmt.Sprintf("warning: could not check CI: %v", err))
+			if s.checkErrs.observe(now(), err) {
+				return ciPersistentPollErrorOutcome("CI", &s.checkErrs, now()), nil
+			}
 		} else {
+			s.checkErrs.reset()
 			// checksPending is the narrow execution state: only checks that are
 			// actively running or queued block a rerun or issue escalation. A
 			// provider-cancelled check is terminal enough to enter the transient

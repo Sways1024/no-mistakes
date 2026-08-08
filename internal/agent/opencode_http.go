@@ -40,6 +40,14 @@ func buildOpencodeServeArgs(extraArgs []string, port int) []string {
 }
 
 func (a *opencodeAgent) createSession(ctx context.Context, baseURL, cwd string) (string, error) {
+	// Bound the control-plane call: a wedged server would otherwise block the
+	// step forever before any event or liveness signal exists (#674).
+	timeout := a.controlTimeout
+	if timeout <= 0 {
+		timeout = opencodeControlTimeout
+	}
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
 	body := map[string]any{
 		"directory": cwd,
 		"permission": []map[string]string{
