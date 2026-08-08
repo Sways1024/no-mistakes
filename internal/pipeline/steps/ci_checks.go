@@ -28,6 +28,47 @@ func pollInterval(elapsed time.Duration) time.Duration {
 	}
 }
 
+// A provider query that fails the same way on every poll is deterministic
+// breakage (expired auth, an incompatible gh version, a renamed repo), not
+// weather. persistentPollErrPolls and persistentPollErrWindow together decide
+// when the monitor stops silently retrying such a failure and parks for a
+// decision: ten consecutive identical failures rules out a blip, and the
+// half-hour floor outlasts routine provider outages and rate-limit windows.
+// Both must be met, so a burst of identical errors at the fast 30s cadence
+// still waits out the window. Without this gate a persistent failure retried
+// invisibly until the CI idle timeout - up to a week (#666).
+const (
+	persistentPollErrPolls  = 10
+	persistentPollErrWindow = 30 * time.Minute
+)
+
+// pollErrStreak tracks consecutive identical failures of one provider query in
+// the CI polling loop. Identity is the exact error string: the deterministic
+// failures the escalation targets repeat verbatim on every poll (the gh
+// backend reports them all as an exit status on the same command), while a
+// message that varies between polls is a condition still changing. A changed
+// message or an interleaved success therefore restarts the streak, which fails
+// toward the pre-existing keep-polling behavior - strictness can only delay
+// the park, never park a recovering provider.
+type pollErrStreak struct {
+	lastErr string    // message of the most recent failure
+	count   int       // consecutive polls that failed with lastErr
+	since   time.Time // when the current streak began
+}
+
+// observe records one failed poll and reports whether the failure has now
+// repeated identically for persistentPollErrPolls polls spanning at least
+// persistentPollErrWindow.
+func (s *pollErrStreak) observe(now time.Time, err error) bool {
+	if msg := err.Error(); msg != s.lastErr {
+		*s = pollErrStreak{lastErr: msg, since: now}
+	}
+	s.count++
+	return s.count >= persistentPollErrPolls && now.Sub(s.since) >= persistentPollErrWindow
+}
+
+func (s *pollErrStreak) reset() { *s = pollErrStreak{} }
+
 // hasFailingChecks returns true if any CI check is in the fail bucket.
 func hasFailingChecks(checks []scm.Check) bool {
 	for _, c := range checks {
@@ -193,6 +234,29 @@ func ciFailureOutcome(failing []string, mergeConflict bool, summary string) *pip
 			Severity:    "warning",
 			Description: "PR has merge conflicts with the base branch",
 		})
+	}
+	findingsJSON, _ := json.Marshal(findings)
+	return &pipeline.StepOutcome{
+		NeedsApproval: true,
+		Findings:      string(findingsJSON),
+	}
+}
+
+// ciPersistentPollErrorOutcome parks the run for a decision when one of the
+// monitor's provider queries keeps failing identically (see pollErrStreak).
+// It is an ask-user gate rather than a hard failure so a long provider outage
+// stays resumable once it clears; what it replaces is a silent retry loop that
+// stalled the run until the idle timeout. what matches the per-poll warning
+// vocabulary ("CI", "PR state", "mergeable state").
+func ciPersistentPollErrorOutcome(what string, streak *pollErrStreak, now time.Time) *pipeline.StepOutcome {
+	findings := Findings{
+		Summary: fmt.Sprintf("CI monitor cannot check %s", what),
+		Items: []Finding{{
+			Severity: "warning",
+			Description: fmt.Sprintf("could not check %s: %s (failed identically on %d consecutive polls over %s)",
+				what, streak.lastErr, streak.count, now.Sub(streak.since).Round(time.Minute)),
+			Action: types.ActionAskUser,
+		}},
 	}
 	findingsJSON, _ := json.Marshal(findings)
 	return &pipeline.StepOutcome{
