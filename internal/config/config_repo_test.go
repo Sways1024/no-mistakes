@@ -260,6 +260,106 @@ func TestLoadGlobal_CIRerunTransientFromFile(t *testing.T) {
 	}
 }
 
+func TestMerge_ReviewMaxRoundsDefaults(t *testing.T) {
+	cfg := Merge(DefaultGlobalConfig(), &RepoConfig{})
+	if cfg.Review.MaxRounds != DefaultReviewMaxRounds {
+		t.Fatalf("review.max_rounds = %d, want %d", cfg.Review.MaxRounds, DefaultReviewMaxRounds)
+	}
+}
+
+func TestMerge_ReviewMaxRoundsFromRepoConfig(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+		want int
+	}{
+		{"explicit cap", "review:\n  max_rounds: 4\n", 4},
+		{"zero means unlimited", "review:\n  max_rounds: 0\n", 0},
+		{"negative means unlimited", "review:\n  max_rounds: -3\n", 0},
+		{"unset keeps the default", "review: {}\n", DefaultReviewMaxRounds},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, ".no-mistakes.yaml"), []byte(tc.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			repo, err := LoadRepo(dir)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			cfg := Merge(DefaultGlobalConfig(), repo)
+			if cfg.Review.MaxRounds != tc.want {
+				t.Fatalf("review.max_rounds = %d, want %d", cfg.Review.MaxRounds, tc.want)
+			}
+		})
+	}
+}
+
+func TestMerge_ReviewMaxRoundsGlobalOverrideYieldsToTrustedRepoValue(t *testing.T) {
+	globalCap := 5
+	global := DefaultGlobalConfig()
+	global.Review.MaxRounds = &globalCap
+
+	if got := Merge(global, &RepoConfig{}).Review.MaxRounds; got != globalCap {
+		t.Fatalf("review.max_rounds with no repo value = %d, want the global %d", got, globalCap)
+	}
+
+	repoCap := 20
+	repo := &RepoConfig{}
+	repo.Review.MaxRounds = &repoCap
+	if got := Merge(global, repo).Review.MaxRounds; got != repoCap {
+		t.Fatalf("review.max_rounds = %d, want the trusted repo value %d", got, repoCap)
+	}
+}
+
+func TestLoadGlobal_ReviewMaxRoundsFromFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.yaml")
+	if err := os.WriteFile(path, []byte("review:\n  max_rounds: 0\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg, err := LoadGlobal(path)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Review.MaxRounds == nil {
+		t.Fatal("global review.max_rounds override was not loaded")
+	}
+	if *cfg.Review.MaxRounds != 0 {
+		t.Fatalf("global review.max_rounds = %d, want 0", *cfg.Review.MaxRounds)
+	}
+}
+
+// The round cap bounds how many agent rereviews a run may bill to the
+// maintainer, so like the rest of the review block it is read only from the
+// trusted default-branch copy: a pushed branch must not raise its own budget.
+func TestEffectiveRepoConfig_ReviewMaxRoundsTrustedOnly(t *testing.T) {
+	pushedCap := 100
+	trustedCap := 2
+	pushed := &RepoConfig{}
+	pushed.Review.MaxRounds = &pushedCap
+	trusted := &RepoConfig{}
+	trusted.Review.MaxRounds = &trustedCap
+
+	got := EffectiveRepoConfig(pushed, trusted, false)
+	if got.Review.MaxRounds == nil || *got.Review.MaxRounds != trustedCap {
+		t.Fatalf("review.max_rounds = %v, want the trusted %d", got.Review.MaxRounds, trustedCap)
+	}
+
+	// Present only on the pushed branch: discarded, so the default/global cap
+	// applies rather than the contributor's.
+	if got := EffectiveRepoConfig(pushed, &RepoConfig{}, false); got.Review.MaxRounds != nil {
+		t.Fatalf("review.max_rounds = %v, want nil (pushed-only value must be ignored)", got.Review.MaxRounds)
+	}
+
+	// No trusted copy at all: still discarded.
+	if got := EffectiveRepoConfig(pushed, nil, false); got.Review.MaxRounds != nil {
+		t.Fatalf("review.max_rounds = %v, want nil without a trusted copy", got.Review.MaxRounds)
+	}
+}
+
 // Every rerun ci.rerun_transient authorizes is another provider-side workflow
 // run billed to the repository, so the budget is read only from the trusted
 // default-branch copy: a pushed branch must not be able to raise its own.

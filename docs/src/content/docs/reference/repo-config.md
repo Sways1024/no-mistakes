@@ -281,6 +281,26 @@ These checks run on whichever copy of the file is parsed, including the pushed b
 
 Like `document.instructions`, this field steers gate behavior, so it is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`, regardless of [`allow_repo_commands`](#allow_repo_commands): a value present only on a pushed branch is ignored, so a contributor cannot inject instructions into the review that gates them.
 
+### review.max_rounds
+
+Maximum total review rounds per run: the initial review plus every fix-triggered rereview.
+
+| | |
+|---|---|
+| Type | `int` |
+| Default | Inherits from global (default `10`) |
+| Unlimited | `0` (or any non-positive value) |
+
+```yaml
+review:
+  max_rounds: 10
+```
+
+Once a run reaches the cap, further `fix` responses to the review gate are rejected and the gate stays parked for an `approve`, `skip`, or `abort` decision, so a reviewer that keeps finding new issues cannot rereview a run indefinitely.
+The global [`review.max_rounds`](/no-mistakes/reference/global-config/#reviewmax_rounds) owns the full semantics.
+
+Like the rest of the `review` block, this value is honored **only from the trusted default-branch copy** of `.no-mistakes.yaml`: each rereview is another agent invocation billed to the machine running the pipeline, so a pushed branch cannot raise its own round budget.
+
 ### Command process lifetime
 
 All configured `commands.*` entries are scoped to their step.

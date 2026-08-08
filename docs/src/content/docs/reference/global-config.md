@@ -53,6 +53,9 @@ auto_fix:
 ci:
   rerun_transient: 0
 
+review:
+  max_rounds: 10
+
 commit:
   fix_message: "chore(no-mistakes-{{.Step}}): {{.Summary}}"
 
@@ -335,6 +338,29 @@ Each rerun is another provider-side workflow run billed to the repository being 
 Set `0` here to never spend someone else's CI minutes; this is the only place to make that choice for a repository whose default branch you do not control.
 
 The per-repo [`ci.rerun_transient`](/no-mistakes/reference/repo-config/#cirerun_transient) overrides this value and owns the classification, the trust boundary, and every case that skips the rerun.
+
+### review.max_rounds
+
+Maximum total review rounds per run: the initial review plus every fix-triggered rereview, whether the fix was requested by `auto_fix.review`, a human, or a driving agent (`axi respond --action fix`).
+
+| | |
+|---|---|
+| Type | `int` |
+| Default | `10` |
+| Unlimited | `0` (or any non-positive value) |
+
+```yaml
+review:
+  max_rounds: 10
+```
+
+Every fix response re-runs the whole review, and a sufficiently thorough reviewer can substantiate new findings on every full pass over a large diff, so without a stopping rule the fix→rereview loop may never converge.
+Once the cap is reached, further `fix` responses are rejected with an error naming the cap, and the review gate stays parked: the responder must choose `approve`, `skip`, or `abort` (or raise the cap and respond again).
+The count is persisted per run, so the cap holds across daemon restarts, and rounds already recorded before a restart still count.
+
+Set `0` to restore the previous unbounded behavior.
+
+The per-repo [`review.max_rounds`](/no-mistakes/reference/repo-config/#reviewmax_rounds) overrides this value from the repository's trusted default branch.
 
 ### commit.fix_message
 

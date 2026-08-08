@@ -61,6 +61,10 @@ type Executor struct {
 	approvalCh  chan approvalResponse // buffered channel for approval responses
 	waiting     bool                  // true when blocked on approval
 	waitingStep types.StepName        // which step is currently awaiting approval
+	// waitingRound is the durably recorded round count of the step currently
+	// awaiting approval (step_rounds rows, so it survives daemon restarts).
+	// RespondWithOverrides reads it to enforce the review fix-round cap.
+	waitingRound int
 
 	gateReconcileInterval time.Duration
 	gateReconcileTimeout  time.Duration
@@ -128,6 +132,19 @@ func (e *Executor) RespondWithOverrides(step types.StepName, action types.Approv
 	if step != e.waitingStep {
 		e.mu.Unlock()
 		return fmt.Errorf("step mismatch: responding to %q but %q is awaiting approval", step, e.waitingStep)
+	}
+	// A fix response re-runs the whole review, and a thorough reviewer can
+	// substantiate new findings on every pass, so past the configured
+	// total-round cap the fix is rejected and the gate stays parked: the
+	// responder is forced to a terminal decision instead of another rereview
+	// (issue #683). The round count is durable (step_rounds), so the cap holds
+	// across daemon restarts; review.max_rounds 0 disables it.
+	if action == types.ActionFix && step == types.StepReview {
+		if limit := e.reviewMaxRounds(); limit > 0 && e.waitingRound >= limit {
+			round := e.waitingRound
+			e.mu.Unlock()
+			return fmt.Errorf("review fix-round cap (%d) reached after %d review rounds; respond with approve, skip, or abort, or raise review.max_rounds", limit, round)
+		}
 	}
 	e.waiting = false
 	e.mu.Unlock()
@@ -329,6 +346,7 @@ func (e *Executor) Resume(ctx context.Context, run *db.Run, repo *db.Repo, workD
 	e.mu.Lock()
 	e.waiting = true
 	e.waitingStep = gate.step.Name()
+	e.waitingRound = gate.round
 	e.mu.Unlock()
 	e.emitStepEventWithFindingsAndError(
 		ipc.EventStepCompleted,
@@ -852,6 +870,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 		e.mu.Lock()
 		e.waiting = true
 		e.waitingStep = stepName
+		e.waitingRound = roundNum
 		e.mu.Unlock()
 
 		// Parking starts before the gate becomes observable. This includes the
@@ -867,6 +886,7 @@ func (e *Executor) executeStep(ctx context.Context, step Step, sr *db.StepResult
 			e.mu.Lock()
 			e.waiting = false
 			e.waitingStep = ""
+			e.waitingRound = 0
 			e.mu.Unlock()
 			return false, fmt.Errorf("persist %s approval gate: %w", stepName, dbErr)
 		}
@@ -1114,6 +1134,7 @@ func (e *Executor) waitForApprovalOrReconcile(ctx context.Context, step Step, sc
 		e.mu.Lock()
 		e.waiting = false
 		e.waitingStep = ""
+		e.waitingRound = 0
 		e.mu.Unlock()
 		// Drain any stale response that arrived after context cancellation or
 		// raced with an external reconciliation.
@@ -1175,7 +1196,17 @@ func (e *Executor) claimGateReconciliation() bool {
 	}
 	e.waiting = false
 	e.waitingStep = ""
+	e.waitingRound = 0
 	return true
+}
+
+// reviewMaxRounds returns the configured cap on total review rounds per run
+// (0 = unlimited).
+func (e *Executor) reviewMaxRounds() int {
+	if e.config == nil {
+		return 0
+	}
+	return e.config.Review.MaxRounds
 }
 
 func (e *Executor) reconcileApprovalGate(ctx context.Context, step Step, sctx *StepContext) (bool, error) {
