@@ -124,18 +124,44 @@ func managedDaemonServiceState(p *paths.Paths, launch managedServiceLaunch) (man
 // forwarded because tooling is inconsistent about which it reads: curl, for
 // instance, honours only the lower-case http_proxy for plain-HTTP requests (it
 // deliberately ignores HTTP_PROXY to avoid the CGI "httpoxy" issue), while many
-// other tools read the upper-case names. serviceProxyEnv only collapses the two
-// spellings on Windows, where they are the same variable.
+// other tools read the upper-case names. serviceForwardedEnv only collapses the
+// two spellings on Windows, where they are the same variable.
 var proxyEnvKeys = []string{
 	"HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY",
 	"http_proxy", "https_proxy", "no_proxy", "all_proxy",
 }
 
-// serviceProxyEnv returns the proxy-related environment entries present in the
-// current (install-time) environment as ordered key/value pairs, skipping any
-// that are unset or empty. Baking these into the generated service definition
-// lets the managed daemon reach the network through the same proxy the user
-// installed with, even when the login-shell environment probe is unavailable.
+// telemetryEnvKeys are the telemetry-related variables forwarded into the
+// managed daemon's environment. The opt-out check reads NO_MISTAKES_TELEMETRY
+// from the process environment (internal/telemetry), but a managed daemon
+// inherits its environment from launchd/systemd - not from the shell that ran
+// `no-mistakes init` - so without forwarding these the documented opt-out
+// silenced only CLI-side events while the daemon kept emitting run/step/
+// approval/fix telemetry (#610). The values are captured at install time;
+// changing one later requires re-rendering the service definition (re-run
+// `no-mistakes init`, or `daemon start`, which reinstalls a drifted
+// definition). Windows needs no forwarding: a schtasks ONLOGON task inherits
+// the interactive logon session's environment (see installWindowsTask).
+var telemetryEnvKeys = []string{
+	"NO_MISTAKES_TELEMETRY", "NO_MISTAKES_UMAMI_HOST", "NO_MISTAKES_UMAMI_WEBSITE_ID",
+}
+
+// forwardedEnvKeys returns every variable forwarded into the managed daemon's
+// environment: the proxy keys followed by the telemetry keys. The category
+// order is fixed so rendered service definitions always list proxy entries
+// before telemetry entries, which keeps mergeForwardedEnv's per-category
+// regrouping byte-for-byte stable across parse/re-render round trips.
+func forwardedEnvKeys() []string {
+	return append(append([]string(nil), proxyEnvKeys...), telemetryEnvKeys...)
+}
+
+// serviceForwardedEnv returns the forwarded environment entries (proxy and
+// telemetry variables, see forwardedEnvKeys) present in the current
+// (install-time) environment as ordered key/value pairs, skipping any that are
+// unset or empty. Baking these into the generated service definition lets the
+// managed daemon reach the network through the same proxy the user installed
+// with - and honor the same telemetry opt-out - even when the login-shell
+// environment probe is unavailable.
 //
 // On case-sensitive platforms (macOS, Linux) every spelling that is set is
 // forwarded verbatim under its own name. That preserves the contract a
@@ -149,13 +175,14 @@ var proxyEnvKeys = []string{
 // the rendered service definition. There the spellings are de-duplicated
 // case-insensitively, keeping the first (upper-case) occurrence; this is
 // harmless because Windows consumers read the variable case-insensitively too.
-func serviceProxyEnv() [][2]string {
+func serviceForwardedEnv() [][2]string {
 	// Only Windows treats environment-variable names case-insensitively; macOS
 	// and Linux keep HTTP_PROXY and http_proxy as distinct variables.
 	caseInsensitiveEnv := runtimeGOOS == "windows"
+	keys := forwardedEnvKeys()
 	var out [][2]string
-	seen := make(map[string]bool, len(proxyEnvKeys))
-	for _, key := range proxyEnvKeys {
+	seen := make(map[string]bool, len(keys))
+	for _, key := range keys {
 		if caseInsensitiveEnv && seen[strings.ToUpper(key)] {
 			continue
 		}
@@ -171,28 +198,76 @@ func serviceProxyEnv() [][2]string {
 	return out
 }
 
+// mergeForwardedEnv combines the live (install-time) forwarded environment
+// with entries already baked into the existing on-disk service definition.
+// Inheritance is per category - proxy and telemetry independently - so a
+// reinstall from a shell that exports only NO_MISTAKES_TELEMETRY cannot strip
+// an already-baked proxy, and a proxy-exporting shell cannot strip an
+// already-baked telemetry opt-out. Within a category the live environment wins
+// outright, mirroring how proxy-only forwarding behaved before telemetry keys
+// joined the forwarded set.
+func mergeForwardedEnv(live, inherited [][2]string) [][2]string {
+	var out [][2]string
+	for _, category := range [][]string{proxyEnvKeys, telemetryEnvKeys} {
+		entries := envEntriesMatching(live, category)
+		if len(entries) == 0 {
+			entries = envEntriesMatching(inherited, category)
+		}
+		out = append(out, entries...)
+	}
+	return out
+}
+
+// envEntriesMatching returns the entries whose key belongs to keys, in their
+// original order.
+func envEntriesMatching(entries [][2]string, keys []string) [][2]string {
+	var out [][2]string
+	for _, kv := range entries {
+		if envKeyMatches(keys, kv[0]) {
+			out = append(out, kv)
+		}
+	}
+	return out
+}
+
+// containsProxyEnv reports whether the forwarded environment carries any proxy
+// entry. The 0600-vs-0644 mode decision in writeServiceFile keys on this
+// rather than on the forwarded environment being non-empty, because only proxy
+// URLs can embed credentials (http://user:pass@host); a definition carrying
+// nothing but telemetry keys holds no secret and keeps the conventional 0644.
+func containsProxyEnv(env [][2]string) bool {
+	for _, kv := range env {
+		if isProxyEnvKey(kv[0]) {
+			return true
+		}
+	}
+	return false
+}
+
 // writeServiceFile renders a generated service definition (systemd unit or
 // launchd plist) via render and writes it with a permission mode that depends
 // on whether proxy values were forwarded into it. When proxy variables are
 // present the file may carry sensitive data (a proxy URL can embed credentials,
 // e.g. http://user:pass@host), so it is restricted to owner-only 0600;
-// otherwise the conventional 0644 is kept so non-proxy installs are
-// byte-for-byte and mode-for-mode unchanged.
+// otherwise the conventional 0644 is kept so proxy-less installs - including
+// ones forwarding only telemetry variables, which hold no secret - are
+// mode-for-mode unchanged (see containsProxyEnv).
 //
-// The proxy environment is resolved here, exactly once, and handed to render so
-// that the rendered content and the permission mode are derived from the same
-// value and cannot disagree. Taking a render callback rather than a finished
-// (content, proxyEnv) pair makes it structurally impossible for a caller to
-// bake proxy credentials into the content yet have it written under the
-// world-readable 0644 mode.
+// The forwarded environment is resolved here, exactly once, and handed to
+// render so that the rendered content and the permission mode are derived from
+// the same value and cannot disagree. Taking a render callback rather than a
+// finished (content, forwardedEnv) pair makes it structurally impossible for a
+// caller to bake proxy credentials into the content yet have it written under
+// the world-readable 0644 mode.
 //
-// When the current environment has no proxy variables set but a proxy was
-// already baked into the existing on-disk definition, the proxy is inherited
-// from that file via parseExistingProxyEnv rather than stripped. This mirrors
-// how reinstallManagedServiceIfChanged inherits the existing executable, and
-// keeps an env-less reinstall (e.g. a binary upgrade) from dropping the proxy
-// the daemon relies on. parseExistingProxyEnv may be nil for callers that never
-// forward a proxy.
+// When the current environment is missing a forwarded category (proxy,
+// telemetry) that was already baked into the existing on-disk definition, that
+// category is inherited from the file via parseExistingForwardedEnv rather
+// than stripped (see mergeForwardedEnv). This mirrors how
+// reinstallManagedServiceIfChanged inherits the existing executable, and keeps
+// an env-less reinstall (e.g. a binary upgrade) from dropping the proxy or the
+// telemetry opt-out the daemon relies on. parseExistingForwardedEnv may be nil
+// for callers that never forward environment.
 //
 // When proxy values are present the content is written to a sibling temp file
 // created at 0600 and atomically renamed over the target, so credential-bearing
@@ -200,15 +275,15 @@ func serviceProxyEnv() [][2]string {
 // os.WriteFile only applies its mode on create, so re-installing over a
 // pre-existing 0644 file (the no-proxy -> proxy transition) would leave the
 // credentials world-readable until a follow-up Chmod tightened the mode.
-func writeServiceFile(path string, parseExistingProxyEnv func([]byte) [][2]string, render func(proxyEnv [][2]string) string) error {
-	proxyEnv := serviceProxyEnv()
-	if len(proxyEnv) == 0 && parseExistingProxyEnv != nil {
+func writeServiceFile(path string, parseExistingForwardedEnv func([]byte) [][2]string, render func(forwardedEnv [][2]string) string) error {
+	forwardedEnv := serviceForwardedEnv()
+	if parseExistingForwardedEnv != nil {
 		if existing, err := os.ReadFile(path); err == nil {
-			proxyEnv = parseExistingProxyEnv(existing)
+			forwardedEnv = mergeForwardedEnv(forwardedEnv, parseExistingForwardedEnv(existing))
 		}
 	}
-	content := []byte(render(proxyEnv))
-	if len(proxyEnv) == 0 {
+	content := []byte(render(forwardedEnv))
+	if !containsProxyEnv(forwardedEnv) {
 		mode := os.FileMode(0o644)
 		if err := os.WriteFile(path, content, mode); err != nil {
 			return err

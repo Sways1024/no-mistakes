@@ -107,12 +107,12 @@ func systemdUnitExecutable(data []byte) (string, bool) {
 	return "", false
 }
 
-// isProxyEnvKey reports whether key is one of the forwarded proxy variables in
-// proxyEnvKeys. The match is exact on case-sensitive platforms (macOS, Linux)
-// so HTTP_PROXY and http_proxy stay distinct; on Windows, where env-var names
-// are case-insensitive, it matches case-insensitively to mirror serviceProxyEnv.
-func isProxyEnvKey(key string) bool {
-	for _, k := range proxyEnvKeys {
+// envKeyMatches reports whether key is one of keys. The match is exact on
+// case-sensitive platforms (macOS, Linux) so HTTP_PROXY and http_proxy stay
+// distinct; on Windows, where env-var names are case-insensitive, it matches
+// case-insensitively to mirror serviceForwardedEnv.
+func envKeyMatches(keys []string, key string) bool {
+	for _, k := range keys {
 		if k == key || (runtimeGOOS == "windows" && strings.EqualFold(k, key)) {
 			return true
 		}
@@ -120,15 +120,28 @@ func isProxyEnvKey(key string) bool {
 	return false
 }
 
-// systemdUnitProxyEnv extracts the forwarded proxy `Environment=` entries from a
-// rendered systemd unit, mirroring systemdUnitExecutable. Entries are returned
-// in file order with systemd's `%` -> `%%` doubling undone, so feeding the
-// result back through renderSystemdUnitWithProxyEnv reproduces the unit
-// byte-for-byte. The fixed HOME/PATH Environment= lines are skipped. This lets
-// drift detection (and a reinstall) inherit a proxy already baked into the
-// on-disk unit when the current shell has no proxy variables exported, instead
-// of silently stripping it. See serviceProxyEnv.
-func systemdUnitProxyEnv(data []byte) [][2]string {
+// isProxyEnvKey reports whether key is one of the forwarded proxy variables in
+// proxyEnvKeys.
+func isProxyEnvKey(key string) bool {
+	return envKeyMatches(proxyEnvKeys, key)
+}
+
+// isForwardedEnvKey reports whether key is any forwarded variable - proxy or
+// telemetry (see forwardedEnvKeys).
+func isForwardedEnvKey(key string) bool {
+	return envKeyMatches(forwardedEnvKeys(), key)
+}
+
+// systemdUnitForwardedEnv extracts the forwarded `Environment=` entries (proxy
+// and telemetry variables) from a rendered systemd unit, mirroring
+// systemdUnitExecutable. Entries are returned in file order with systemd's `%`
+// -> `%%` doubling undone, so feeding the result back through
+// renderSystemdUnitWithForwardedEnv reproduces the unit byte-for-byte. The
+// fixed HOME/PATH Environment= lines are skipped. This lets drift detection
+// (and a reinstall) inherit a proxy or telemetry opt-out already baked into
+// the on-disk unit when the current shell does not export those variables,
+// instead of silently stripping it. See serviceForwardedEnv.
+func systemdUnitForwardedEnv(data []byte) [][2]string {
 	var out [][2]string
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
@@ -143,7 +156,7 @@ func systemdUnitProxyEnv(data []byte) [][2]string {
 		// contain %, so undoing before the split is safe.
 		assignment = strings.ReplaceAll(assignment, "%%", "%")
 		key, value, ok := strings.Cut(assignment, "=")
-		if !ok || !isProxyEnvKey(key) {
+		if !ok || !isForwardedEnvKey(key) {
 			continue
 		}
 		out = append(out, [2]string{key, value})
@@ -151,13 +164,13 @@ func systemdUnitProxyEnv(data []byte) [][2]string {
 	return out
 }
 
-// launchAgentProxyEnv extracts the forwarded proxy entries from the
-// EnvironmentVariables <dict> of a rendered launchd plist, mirroring
-// launchAgentExecutable. Pairs are returned in file order with XML escaping
-// undone by the decoder; the fixed HOME/PATH keys are skipped. Feeding the
-// result back through renderLaunchAgentWithProxyEnv reproduces the plist. See
-// serviceProxyEnv.
-func launchAgentProxyEnv(data []byte) [][2]string {
+// launchAgentForwardedEnv extracts the forwarded entries (proxy and telemetry
+// variables) from the EnvironmentVariables <dict> of a rendered launchd plist,
+// mirroring launchAgentExecutable. Pairs are returned in file order with XML
+// escaping undone by the decoder; the fixed HOME/PATH keys are skipped.
+// Feeding the result back through renderLaunchAgentWithForwardedEnv reproduces
+// the plist. See serviceForwardedEnv.
+func launchAgentForwardedEnv(data []byte) [][2]string {
 	decoder := xml.NewDecoder(bytes.NewReader(data))
 	var out [][2]string
 	var sawEnvVarsKey bool // the most recent <key> was "EnvironmentVariables"
@@ -197,7 +210,7 @@ func launchAgentProxyEnv(data []byte) [][2]string {
 				if err := decoder.DecodeElement(&value, &t); err != nil {
 					return out
 				}
-				if isProxyEnvKey(pendingKey) {
+				if isForwardedEnvKey(pendingKey) {
 					out = append(out, [2]string{pendingKey, value})
 				}
 				havePendingKey = false

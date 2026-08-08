@@ -159,91 +159,91 @@ func TestInstallSystemdUserServiceKeepsLegacyUnitOnEnableFailure(t *testing.T) {
 	}
 }
 
-func TestServiceProxyEnvSkipsUnsetAndEmpty(t *testing.T) {
-	for _, key := range proxyEnvKeys {
+func TestServiceForwardedEnvSkipsUnsetAndEmpty(t *testing.T) {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
 
-	got := serviceProxyEnv()
+	got := serviceForwardedEnv()
 	if len(got) != 1 || got[0][0] != "HTTPS_PROXY" || got[0][1] != "http://127.0.0.1:7897" {
-		t.Fatalf("serviceProxyEnv() = %v, want a single HTTPS_PROXY entry", got)
+		t.Fatalf("serviceForwardedEnv() = %v, want a single HTTPS_PROXY entry", got)
 	}
 }
 
-// TestServiceProxyEnvDedupesOnCaseInsensitivePlatforms reproduces the Windows
+// TestServiceForwardedEnvDedupesOnCaseInsensitivePlatforms reproduces the Windows
 // CI failure: with case-insensitive env-var names, HTTPS_PROXY and https_proxy
 // resolve to one variable with one value, and forwarding both spellings would
-// bake a duplicate entry into the rendered service definition. serviceProxyEnv
-// must collapse them into a single entry. runtimeGOOS is forced to "windows" so
+// bake a duplicate entry into the rendered service definition.
+// serviceForwardedEnv must collapse them into a single entry. runtimeGOOS is forced to "windows" so
 // the dedup branch is exercised deterministically on any host; both spellings
 // are set to the same value, mirroring how a case-insensitive environment
 // resolves them.
-func TestServiceProxyEnvDedupesOnCaseInsensitivePlatforms(t *testing.T) {
+func TestServiceForwardedEnvDedupesOnCaseInsensitivePlatforms(t *testing.T) {
 	oldGOOS := runtimeGOOS
 	runtimeGOOS = "windows"
 	t.Cleanup(func() { runtimeGOOS = oldGOOS })
 
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
 	t.Setenv("https_proxy", "http://127.0.0.1:7897")
 
-	got := serviceProxyEnv()
+	got := serviceForwardedEnv()
 	if len(got) != 1 || got[0][0] != "HTTPS_PROXY" || got[0][1] != "http://127.0.0.1:7897" {
-		t.Fatalf("serviceProxyEnv() = %v, want a single de-duplicated HTTPS_PROXY entry", got)
+		t.Fatalf("serviceForwardedEnv() = %v, want a single de-duplicated HTTPS_PROXY entry", got)
 	}
 }
 
-// TestServiceProxyEnvForwardsBothSpellingsOnCaseSensitivePlatforms guards that
+// TestServiceForwardedEnvForwardsBothSpellingsOnCaseSensitivePlatforms guards that
 // macOS/Linux behaviour is unchanged: when both spellings are set to different
 // values they are distinct variables and BOTH are forwarded verbatim, in
 // declaration order. Skipped on Windows, where the two spellings cannot hold
 // different values.
-func TestServiceProxyEnvForwardsBothSpellingsOnCaseSensitivePlatforms(t *testing.T) {
+func TestServiceForwardedEnvForwardsBothSpellingsOnCaseSensitivePlatforms(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("env-var names are case-insensitive on Windows; the two spellings are one variable")
 	}
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTP_PROXY", "http://upper:1/")
 	t.Setenv("http_proxy", "http://lower:2/")
 
-	got := serviceProxyEnv()
+	got := serviceForwardedEnv()
 	want := [][2]string{
 		{"HTTP_PROXY", "http://upper:1/"},
 		{"http_proxy", "http://lower:2/"},
 	}
 	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("serviceProxyEnv() = %v, want both spellings forwarded verbatim %v", got, want)
+		t.Fatalf("serviceForwardedEnv() = %v, want both spellings forwarded verbatim %v", got, want)
 	}
 }
 
-// TestServiceProxyEnvForwardsLowerOnlySpelling is the regression guard for the
+// TestServiceForwardedEnvForwardsLowerOnlySpelling is the regression guard for the
 // curl case: a proxy exported only as the lower-case http_proxy must reach the
 // daemon as http_proxy, not normalised to HTTP_PROXY, because curl honours only
 // the lower-case spelling for plain-HTTP requests. Skipped on Windows, where
 // the spelling is not preserved (and need not be, as lookups are
 // case-insensitive there).
-func TestServiceProxyEnvForwardsLowerOnlySpelling(t *testing.T) {
+func TestServiceForwardedEnvForwardsLowerOnlySpelling(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("env-var names are case-insensitive on Windows; spelling is not preserved")
 	}
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("http_proxy", "http://127.0.0.1:7897")
 
-	got := serviceProxyEnv()
+	got := serviceForwardedEnv()
 	if len(got) != 1 || got[0][0] != "http_proxy" || got[0][1] != "http://127.0.0.1:7897" {
-		t.Fatalf("serviceProxyEnv() = %v, want the lower-case http_proxy spelling preserved", got)
+		t.Fatalf("serviceForwardedEnv() = %v, want the lower-case http_proxy spelling preserved", got)
 	}
 }
 
 func TestRenderSystemdUnitForwardsProxyEnv(t *testing.T) {
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	t.Setenv("HTTPS_PROXY", "http://127.0.0.1:7897")
@@ -260,22 +260,23 @@ func TestRenderSystemdUnitForwardsProxyEnv(t *testing.T) {
 	}
 }
 
-// TestRenderSystemdUnitForwardsEveryProxyEnvKey guards that the renderer and
-// proxyEnvKeys cannot drift apart: every declared key handed to the renderer -
-// both the upper- and lower-case spellings - must reach the unit as its own
-// Environment= line. The proxy environment is injected directly rather than
-// read from the process environment so the assertion is independent of the
-// host's env-var case sensitivity (it ran on Windows CI, where setting both
-// spellings to distinct values is impossible); serviceProxyEnv's own
-// platform-specific behaviour is covered by the TestServiceProxyEnv* tests.
-func TestRenderSystemdUnitForwardsEveryProxyEnvKey(t *testing.T) {
-	var proxyEnv [][2]string
-	for _, key := range proxyEnvKeys {
-		proxyEnv = append(proxyEnv, [2]string{key, "val-" + key})
+// TestRenderSystemdUnitForwardsEveryForwardedEnvKey guards that the renderer
+// and forwardedEnvKeys cannot drift apart: every declared key handed to the
+// renderer - proxy spellings in both cases plus the telemetry keys - must
+// reach the unit as its own Environment= line. The forwarded environment is
+// injected directly rather than read from the process environment so the
+// assertion is independent of the host's env-var case sensitivity (it ran on
+// Windows CI, where setting both spellings to distinct values is impossible);
+// serviceForwardedEnv's own platform-specific behaviour is covered by the
+// TestServiceForwardedEnv* tests.
+func TestRenderSystemdUnitForwardsEveryForwardedEnvKey(t *testing.T) {
+	var forwardedEnv [][2]string
+	for _, key := range forwardedEnvKeys() {
+		forwardedEnv = append(forwardedEnv, [2]string{key, "val-" + key})
 	}
 
-	unit := renderSystemdUnitWithProxyEnv("/usr/local/bin/no-mistakes", paths.WithRoot(t.TempDir()), "/home/u", proxyEnv)
-	for _, key := range proxyEnvKeys {
+	unit := renderSystemdUnitWithForwardedEnv("/usr/local/bin/no-mistakes", paths.WithRoot(t.TempDir()), "/home/u", forwardedEnv)
+	for _, key := range forwardedEnvKeys() {
 		want := `Environment="` + key + "=val-" + key + `"`
 		if !strings.Contains(unit, want) {
 			t.Fatalf("systemd unit should forward %s, want %q, got:\n%s", key, want, unit)
@@ -297,7 +298,7 @@ func TestRenderSystemdUnitEscapesPercentInProxyEnv(t *testing.T) {
 		{"HTTPS_PROXY", "http://user:p%40ss%3Aw0rd@proxy:8080"},
 	}
 
-	unit := renderSystemdUnitWithProxyEnv("/usr/local/bin/no-mistakes", paths.WithRoot(t.TempDir()), "/home/u", proxyEnv)
+	unit := renderSystemdUnitWithForwardedEnv("/usr/local/bin/no-mistakes", paths.WithRoot(t.TempDir()), "/home/u", proxyEnv)
 	want := `Environment="HTTPS_PROXY=http://user:p%%40ss%%3Aw0rd@proxy:8080"`
 	if !strings.Contains(unit, want) {
 		t.Fatalf("systemd unit should double %% in proxy env so it survives specifier expansion, want %q, got:\n%s", want, unit)
@@ -311,7 +312,7 @@ func TestWriteServiceFileTightensModeWhenProxyPresent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file modes (0644/0600) are not enforced on Windows; the proxy-bearing service file is only generated on macOS/Linux")
 	}
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	dir := t.TempDir()
@@ -354,7 +355,7 @@ func TestWriteServiceFileReplacesAtomicallyWhenProxyPresent(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file modes (0644/0600) are not enforced on Windows; the proxy-bearing service file is only generated on macOS/Linux")
 	}
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	dir := t.TempDir()

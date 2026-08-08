@@ -447,7 +447,7 @@ func TestStartRestoresStaleSystemdUnitAtOriginalModeWhenRefreshInstallFails(t *t
 	if runtime.GOOS == "windows" {
 		t.Skip("POSIX file modes (0600) are not enforced on Windows; the proxy-bearing service file is only generated on macOS/Linux")
 	}
-	for _, key := range proxyEnvKeys {
+	for _, key := range forwardedEnvKeys() {
 		t.Setenv(key, "")
 	}
 	p := paths.WithRoot(filepath.Join(t.TempDir(), "nm-home"))
