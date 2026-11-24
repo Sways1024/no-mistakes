@@ -305,6 +305,13 @@ func (h *Host) GetChecks(ctx context.Context, pr *scm.PR) ([]scm.Check, error) {
 		if strings.Contains(string(out), "no checks reported") {
 			return nil, nil
 		}
+		if isChecksAPIRefusal(out) {
+			checks, fallbackErr := h.restrictedTokenChecks(ctx, pr)
+			if fallbackErr != nil {
+				return nil, fmt.Errorf("gh pr checks: token cannot read the Checks API, and the Actions/status fallback failed: %w", fallbackErr)
+			}
+			return checks, nil
+		}
 		return nil, fmt.Errorf("gh pr checks: %w", err)
 	}
 	var raw []struct {

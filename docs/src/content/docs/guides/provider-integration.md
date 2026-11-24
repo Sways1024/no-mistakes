@@ -66,6 +66,7 @@ gh auth status
 
 `no-mistakes doctor` also checks for `gh` availability.
 For PR and workflow-run commands, no-mistakes passes the repository slug from the recorded upstream remote or PR URL to `gh`, so daemon-run commands do not depend on the daemon's current working directory.
+A fine-grained personal access token cannot read the Checks API, so when `gh pr checks` is refused with "Resource not accessible by personal access token", CI monitoring falls back to the GitHub Actions jobs for the PR head commit plus the commit's aggregate status, and holds the step while any check the token cannot see is pending or failing. That fallback needs at least Actions read access on the repository.
 
 **What you get:**
 
